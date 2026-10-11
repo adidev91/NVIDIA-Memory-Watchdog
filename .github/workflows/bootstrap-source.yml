@@ -15,20 +15,19 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Expand prepared source package
+      - name: Reconstruct prepared source files
         shell: bash
         run: |
           set -euo pipefail
-          if [ ! -f .bootstrap/nvmw.zip ]; then
-            echo "Bootstrap archive not present; nothing to do."
+
+          if [ ! -f .bootstrap/READY ]; then
+            echo "Bootstrap is not complete yet; waiting for READY marker."
             exit 0
           fi
 
-          rm -rf .bootstrap/extracted
-          mkdir -p .bootstrap/extracted
-          unzip -q .bootstrap/nvmw.zip -d .bootstrap/extracted
-
-          cp -a .bootstrap/extracted/nvmw/. .
+          cat .bootstrap/main.cpp.b64.* | base64 -d > main.cpp
+          cat .bootstrap/NvidiaMemoryWatchdog.ico.b64.* | base64 -d > NvidiaMemoryWatchdog.ico
+          cat .bootstrap/icon_preview.png.b64.* | base64 -d > icon_preview.png
 
           rm -rf .bootstrap
           rm -f .github/workflows/bootstrap-source.yml
