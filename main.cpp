@@ -1263,11 +1263,12 @@ static void RemoveLegacyScheduledTasksSilently()
     if (schtasks.empty())
         return;
 
+    // Remove only task names used by older builds. Never remove the current
+    // NVIDIA PowerState Watchdog task here; it is controlled by the checkbox.
     const wchar_t* taskNames[] =
     {
         L"NVIDIA VRAM Watchdog",
-        L"NVIDIA Memory Watchdog",
-        L"NVIDIA PowerState Watchdog"
+        L"NVIDIA Memory Watchdog"
     };
 
     for (const wchar_t* taskName : taskNames)
@@ -1276,7 +1277,12 @@ static void RemoveLegacyScheduledTasksSilently()
         bool timedOut = false;
         const std::wstring queryArgs = L"/Query /TN \"" + std::wstring(taskName) + L"\"";
 
-        if (!RunHiddenProcess(schtasks, queryArgs, SCHTASKS_PROCESS_TIMEOUT_MS, queryCode, timedOut) ||
+        if (!RunHiddenProcess(
+                schtasks,
+                queryArgs,
+                SCHTASKS_PROCESS_TIMEOUT_MS,
+                queryCode,
+                timedOut) ||
             queryCode != 0)
         {
             continue;
@@ -1285,56 +1291,123 @@ static void RemoveLegacyScheduledTasksSilently()
         DWORD deleteCode = ERROR_GEN_FAILURE;
         timedOut = false;
         const std::wstring deleteArgs = L"/Delete /F /TN \"" + std::wstring(taskName) + L"\"";
-        RunHiddenProcess(schtasks, deleteArgs, SCHTASKS_PROCESS_TIMEOUT_MS, deleteCode, timedOut);
+        RunHiddenProcess(
+            schtasks,
+            deleteArgs,
+            SCHTASKS_PROCESS_TIMEOUT_MS,
+            deleteCode,
+            timedOut);
     }
 }
 
-static bool UpdateStartupRegistration(bool enabled)
+static bool RemoveRunStartupValuesSilently()
 {
     HKEY key = nullptr;
     const wchar_t* runKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 
-    if (RegCreateKeyExW(
-            HKEY_CURRENT_USER,
-            runKey,
-            0,
-            nullptr,
-            0,
-            KEY_SET_VALUE,
-            nullptr,
-            &key,
-            nullptr) != ERROR_SUCCESS)
-    {
+    const LSTATUS openResult = RegOpenKeyExW(
+        HKEY_CURRENT_USER,
+        runKey,
+        0,
+        KEY_QUERY_VALUE | KEY_SET_VALUE,
+        &key);
+
+    if (openResult != ERROR_SUCCESS)
         return false;
-    }
 
-    const wchar_t* valueName = L"NVIDIA PowerState Watchdog";
-    bool ok = true;
+    bool currentValueExisted = false;
+    DWORD type = 0;
+    DWORD bytes = 0;
 
-    if (enabled)
+    if (RegQueryValueExW(
+            key,
+            L"NVIDIA PowerState Watchdog",
+            nullptr,
+            &type,
+            nullptr,
+            &bytes) == ERROR_SUCCESS)
     {
-        const std::wstring command = L"\"" + ExePath() + L"\" --startup";
-        const DWORD bytes = static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t));
-        ok = RegSetValueExW(
-                 key,
-                 valueName,
-                 0,
-                 REG_SZ,
-                 reinterpret_cast<const BYTE*>(command.c_str()),
-                 bytes) == ERROR_SUCCESS;
-    }
-    else
-    {
-        const LSTATUS r = RegDeleteValueW(key, valueName);
-        ok = (r == ERROR_SUCCESS || r == ERROR_FILE_NOT_FOUND);
+        currentValueExisted = true;
     }
 
-    // Remove only legacy Run-value names silently if they happen to exist.
+    // The elevated watchdog cannot be launched reliably from the normal Run
+    // key. Remove Run-key registrations from this and older builds.
+    RegDeleteValueW(key, L"NVIDIA PowerState Watchdog");
     RegDeleteValueW(key, L"NVIDIA VRAM Watchdog");
     RegDeleteValueW(key, L"NVIDIA Memory Watchdog");
 
     RegCloseKey(key);
-    return ok;
+    return currentValueExisted;
+}
+
+static bool UpdateStartupTask(bool enabled)
+{
+    const std::wstring taskName = L"NVIDIA PowerState Watchdog";
+    const std::wstring schtasks = SystemExecutablePath(L"schtasks.exe");
+    if (schtasks.empty())
+        return false;
+
+    DWORD exitCode = ERROR_GEN_FAILURE;
+    bool timedOut = false;
+
+    if (!enabled)
+    {
+        const std::wstring deleteArguments =
+            L"/Delete /F /TN \"" + taskName + L"\"";
+
+        if (!RunHiddenProcess(
+                schtasks,
+                deleteArguments,
+                SCHTASKS_PROCESS_TIMEOUT_MS,
+                exitCode,
+                timedOut))
+        {
+            return false;
+        }
+
+        if (exitCode == 0)
+            return true;
+
+        // If deletion returned a non-zero code, verify that the task is
+        // actually absent before reporting failure.
+        DWORD queryExitCode = ERROR_GEN_FAILURE;
+        bool queryTimedOut = false;
+        const std::wstring queryArguments =
+            L"/Query /TN \"" + taskName + L"\"";
+
+        if (!RunHiddenProcess(
+                schtasks,
+                queryArguments,
+                SCHTASKS_PROCESS_TIMEOUT_MS,
+                queryExitCode,
+                queryTimedOut))
+        {
+            return false;
+        }
+
+        return queryExitCode != 0;
+    }
+
+    const std::wstring exe = ExePath();
+
+    // Run at logon with highest privileges so the watchdog starts elevated
+    // without relying on the normal HKCU Run startup path.
+    const std::wstring arguments =
+        L"/Create /F /SC ONLOGON /RL HIGHEST "
+        L"/TN \"" + taskName + L"\" "
+        L"/TR \"\\\"" + exe + L"\\\" --startup\"";
+
+    if (!RunHiddenProcess(
+            schtasks,
+            arguments,
+            SCHTASKS_PROCESS_TIMEOUT_MS,
+            exitCode,
+            timedOut))
+    {
+        return false;
+    }
+
+    return exitCode == 0;
 }
 
 // =============================================================================
@@ -3300,6 +3373,36 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             }
             return 0;
 
+        case ID_STARTUP:
+            if (HIWORD(wParam) == BN_CLICKED)
+            {
+                const bool previous = g_settings.startWithWindows;
+                const bool requested = IsChecked(g_chkStartup);
+
+                if (UpdateStartupTask(requested))
+                {
+                    g_settings.startWithWindows = requested;
+                    SaveSettings();
+
+                    AppendLog(
+                        requested
+                            ? L"Start with Windows enabled."
+                            : L"Start with Windows disabled.");
+                }
+                else
+                {
+                    // Keep the UI and saved setting truthful if task creation
+                    // or deletion fails.
+                    SetChecked(g_chkStartup, previous);
+
+                    AppendLog(
+                        requested
+                            ? L"Could not create the Windows startup task."
+                            : L"Could not remove the Windows startup task.");
+                }
+            }
+            return 0;
+
         case ID_SAVE:
         {
             const unsigned int oldGpuIndex = g_settings.gpuIndex;
@@ -3323,8 +3426,6 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                     RefreshPStateChoices(true);
                 }
             }
-
-            UpdateStartupRegistration(g_settings.startWithWindows);
 
             UpdateMainTelemetry();
             return 0;
@@ -3464,8 +3565,15 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR cmdLine, int nCmdSh
     }
 
     LoadSettings();
+
+    // Migrate the short-lived Run-key implementation to the elevated scheduled
+    // task once. After migration, the Start with Windows checkbox exclusively
+    // creates or deletes the current task.
+    const bool hadRunStartup = RemoveRunStartupValuesSilently();
     RemoveLegacyScheduledTasksSilently();
-    UpdateStartupRegistration(g_settings.startWithWindows);
+
+    if (hadRunStartup && g_settings.startWithWindows)
+        UpdateStartupTask(true);
 
     INITCOMMONCONTROLSEX icc = {};
     icc.dwSize = sizeof(icc);
