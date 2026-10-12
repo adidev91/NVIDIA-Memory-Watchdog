@@ -8,28 +8,26 @@
 #include <shellapi.h>
 #include <commctrl.h>
 #include <setupapi.h>
-#include <cfgmgr32.h>
 #include <dwmapi.h>
 
 #include <algorithm>
-#include <fstream>
-#include <functional>
+#include <atomic>
 #include <sstream>
 #include <string>
 #include <vector>
 #include <cwchar>
-#include <cwctype>
 #include <process.h>
 #include <cstdint>
+#include <climits>
+#include <functional>
+#include <utility>
 
 #include "resource.h"
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "setupapi.lib")
-#pragma comment(lib, "cfgmgr32.lib")
 #pragma comment(lib, "dwmapi.lib")
-#pragma comment(lib, "advapi32.lib")
 
 // =============================================================================
 // Minimal NVML declarations.
@@ -92,13 +90,8 @@ struct Telemetry
 struct PStateChoice
 {
     int pstate = -1;
-    unsigned int reportedMemMinMHz = 0;
-    unsigned int reportedMemMaxMHz = 0;
     unsigned int lockMinMHz = 0;
     unsigned int lockMaxMHz = 0;
-    int memOffsetMHz = 0;
-    bool memOffsetAvailable = false;
-    bool controllable = false;
 };
 
 class Nvml
@@ -161,7 +154,6 @@ public:
             return false;
         }
 
-        gpuIndex_ = gpuIndex;
         gpuName_.clear();
 
         if (getName_)
@@ -493,7 +485,6 @@ private:
     HMODULE dll_ = nullptr;
     bool initialized_ = false;
     nvmlDevice_t device_ = nullptr;
-    unsigned int gpuIndex_ = 0;
     std::string gpuName_;
 
     PFN_nvmlInit_v2 init_ = nullptr;
@@ -526,7 +517,7 @@ struct Settings
     unsigned int pollMs = 500;
     unsigned int unlockAttempts = 3;
 
-    bool autoRestore = true;
+    bool autoRestore = false;
     bool showTrayTelemetry = true;
     bool startWithWindows = false;
     bool startMinimized = true;
@@ -592,7 +583,7 @@ static void LoadSettings()
         static_cast<unsigned int>(GetPrivateProfileIntW(L"Watchdog", L"UnlockAttempts", 3, ini.c_str()));
 
     g_settings.autoRestore =
-        GetPrivateProfileIntW(L"Watchdog", L"AutoRestore", 1, ini.c_str()) != 0;
+        GetPrivateProfileIntW(L"Watchdog", L"AutoRestore", 0, ini.c_str()) != 0;
 
     g_settings.showTrayTelemetry =
         GetPrivateProfileIntW(L"Watchdog", L"ShowTrayTelemetry", 1, ini.c_str()) != 0;
@@ -650,13 +641,10 @@ static HWND g_main = nullptr;
 static HWND g_hover = nullptr;
 
 static HWND g_lblGpu = nullptr;
-static HWND g_lblPstateCaption = nullptr;
 static HWND g_lblPstate = nullptr;
-static HWND g_lblMemCaption = nullptr;
 static HWND g_lblMem = nullptr;
 static HWND g_lblMemOcCaption = nullptr;
 static HWND g_lblMemOc = nullptr;
-static HWND g_lblGpuClockCaption = nullptr;
 static HWND g_lblGpuClock = nullptr;
 static HWND g_lblPowerCaption = nullptr;
 static HWND g_lblPower = nullptr;
@@ -737,14 +725,23 @@ static unsigned int g_stateUnlockAttemptCount = 0;
 static bool g_stateUnlockLimitReported = false;
 static ULONGLONG g_nextStateUnlockAllowedTick = 0;
 static bool g_stateUnlockWorkerRunning = false;
-static bool g_stateUnlockVerifying = false;
+enum class RecoveryVerifyMode
+{
+    None,
+    ConfirmObservedTarget,
+    NpcfAcquireTarget
+};
+
+static RecoveryVerifyMode g_recoveryVerifyMode = RecoveryVerifyMode::None;
 static ULONGLONG g_stateUnlockVerifyDeadline = 0;
-static int g_stateUnlockLastObservedPState = -1;
+static unsigned int g_stateUnlockStableSamples = 0;
+static std::atomic<unsigned long long> g_recoveryGeneration{1};
 
 static constexpr unsigned int NORMAL_LOCK_RETRIES_BEFORE_UNLOCK = 3;
 static constexpr ULONGLONG POST_STATE_UNLOCK_GRACE_MS = 5000;
-static constexpr DWORD STATE_UNLOCK_VERIFY_TIMEOUT_MS = 3000;
+static constexpr DWORD STATE_UNLOCK_ACQUIRE_TIMEOUT_MS = 3000;
 static constexpr UINT STATE_UNLOCK_VERIFY_INTERVAL_MS = 100;
+static constexpr unsigned int STATE_UNLOCK_STABLE_SAMPLES_REQUIRED = 5;
 static constexpr DWORD PNPUTIL_PROCESS_TIMEOUT_MS = 15000;
 static constexpr DWORD SCHTASKS_PROCESS_TIMEOUT_MS = 15000;
 
@@ -877,8 +874,70 @@ static void AppendLog(const std::wstring& text)
     }
 }
 
+static bool StartMainTimer(UINT_PTR timerId, UINT intervalMs, const wchar_t* failureMessage = nullptr)
+{
+    if (!g_main)
+        return false;
+
+    if (SetTimer(g_main, timerId, intervalMs, nullptr) != 0)
+        return true;
+
+    if (failureMessage)
+        AppendLog(failureMessage);
+
+    return false;
+}
+
+static bool RunHiddenProcess(
+    const std::wstring& applicationPath,
+    const std::wstring& arguments,
+    DWORD timeoutMs,
+    DWORD& exitCode)
+{
+    exitCode = ERROR_GEN_FAILURE;
+    if (applicationPath.empty())
+        return false;
+
+    STARTUPINFOW startup = {};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process = {};
+
+    std::wstring commandLine = L"\"" + applicationPath + L"\"";
+    if (!arguments.empty())
+        commandLine += L" " + arguments;
+
+    std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
+    mutableCommand.push_back(L'\0');
+
+    if (!CreateProcessW(
+            applicationPath.c_str(),
+            mutableCommand.data(),
+            nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+            nullptr, nullptr, &startup, &process))
+    {
+        return false;
+    }
+
+    const DWORD waitResult = WaitForSingleObject(process.hProcess, timeoutMs);
+    if (waitResult == WAIT_OBJECT_0)
+    {
+        if (!GetExitCodeProcess(process.hProcess, &exitCode))
+            exitCode = GetLastError();
+    }
+    else
+    {
+        exitCode = waitResult == WAIT_TIMEOUT ? WAIT_TIMEOUT : GetLastError();
+        TerminateProcess(process.hProcess, exitCode);
+        WaitForSingleObject(process.hProcess, 1000);
+    }
+
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return waitResult == WAIT_OBJECT_0;
+}
+
 // =============================================================================
-// Windows startup registration
+// Windows process / device helpers
 // =============================================================================
 
 static std::wstring SystemExecutablePath(const wchar_t* exeName)
@@ -893,87 +952,6 @@ static std::wstring SystemExecutablePath(const wchar_t* exeName)
     return path;
 }
 
-static bool RunHiddenProcess(
-    const std::wstring& applicationPath,
-    const std::wstring& arguments,
-    DWORD timeoutMs,
-    DWORD& exitCode,
-    bool& timedOut)
-{
-    exitCode = ERROR_GEN_FAILURE;
-    timedOut = false;
-
-    if (applicationPath.empty())
-        return false;
-
-    STARTUPINFOW si = {};
-    si.cb = sizeof(si);
-
-    PROCESS_INFORMATION pi = {};
-
-    // lpApplicationName is an absolute System32 path for all elevated helper
-    // processes. This prevents executable search-order hijacking. The command
-    // line still includes argv[0], as CreateProcess expects.
-    std::wstring commandLine = L"\"" + applicationPath + L"\"";
-    if (!arguments.empty())
-    {
-        commandLine += L" ";
-        commandLine += arguments;
-    }
-
-    std::vector<wchar_t> cmd(commandLine.begin(), commandLine.end());
-    cmd.push_back(L'\0');
-
-    if (!CreateProcessW(
-            applicationPath.c_str(),
-            cmd.data(),
-            nullptr,
-            nullptr,
-            FALSE,
-            CREATE_NO_WINDOW,
-            nullptr,
-            nullptr,
-            &si,
-            &pi))
-    {
-        return false;
-    }
-
-    const DWORD wait = WaitForSingleObject(pi.hProcess, timeoutMs);
-
-    if (wait == WAIT_TIMEOUT)
-    {
-        timedOut = true;
-        exitCode = WAIT_TIMEOUT;
-        TerminateProcess(pi.hProcess, WAIT_TIMEOUT);
-        WaitForSingleObject(pi.hProcess, 1000);
-    }
-    else if (wait == WAIT_OBJECT_0)
-    {
-        if (!GetExitCodeProcess(pi.hProcess, &exitCode))
-            exitCode = GetLastError();
-    }
-    else
-    {
-        exitCode = GetLastError();
-    }
-
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-
-    return wait == WAIT_OBJECT_0;
-}
-
-static std::wstring UpperCopy(std::wstring value)
-{
-    std::transform(
-        value.begin(),
-        value.end(),
-        value.begin(),
-        [](wchar_t ch) { return static_cast<wchar_t>(std::towupper(ch)); });
-    return value;
-}
-
 static std::wstring ReadDeviceStringProperty(
     HDEVINFO info,
     SP_DEVINFO_DATA& dev,
@@ -983,19 +961,12 @@ static std::wstring ReadDeviceStringProperty(
     DWORD bytes = 0;
 
     SetupDiGetDeviceRegistryPropertyW(
-        info,
-        &dev,
-        property,
-        &type,
-        nullptr,
-        0,
-        &bytes);
+        info, &dev, property, &type, nullptr, 0, &bytes);
 
     if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || bytes == 0)
         return {};
 
     std::vector<BYTE> buffer(bytes + sizeof(wchar_t) * 2, 0);
-
     if (!SetupDiGetDeviceRegistryPropertyW(
             info,
             &dev,
@@ -1003,75 +974,14 @@ static std::wstring ReadDeviceStringProperty(
             &type,
             buffer.data(),
             static_cast<DWORD>(buffer.size()),
-            nullptr))
+            nullptr) ||
+        (type != REG_SZ && type != REG_EXPAND_SZ))
     {
         return {};
     }
-
-    if (type != REG_SZ && type != REG_EXPAND_SZ)
-        return {};
 
     return reinterpret_cast<const wchar_t*>(buffer.data());
 }
-
-static std::vector<std::wstring> ReadDeviceMultiStringProperty(
-    HDEVINFO info,
-    SP_DEVINFO_DATA& dev,
-    DWORD property)
-{
-    std::vector<std::wstring> values;
-    DWORD type = 0;
-    DWORD bytes = 0;
-
-    SetupDiGetDeviceRegistryPropertyW(
-        info,
-        &dev,
-        property,
-        &type,
-        nullptr,
-        0,
-        &bytes);
-
-    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || bytes == 0)
-        return values;
-
-    std::vector<BYTE> buffer(bytes + sizeof(wchar_t) * 2, 0);
-
-    if (!SetupDiGetDeviceRegistryPropertyW(
-            info,
-            &dev,
-            property,
-            &type,
-            buffer.data(),
-            static_cast<DWORD>(buffer.size()),
-            nullptr))
-    {
-        return values;
-    }
-
-    if (type != REG_MULTI_SZ && type != REG_SZ)
-        return values;
-
-    const wchar_t* p = reinterpret_cast<const wchar_t*>(buffer.data());
-    while (*p)
-    {
-        std::wstring value = p;
-        values.push_back(value);
-        p += value.size() + 1;
-
-        if (type == REG_SZ)
-            break;
-    }
-
-    return values;
-}
-
-struct NpcfCandidate
-{
-    std::wstring instanceId;
-    std::wstring name;
-    int score = 0;
-};
 
 static bool FindNpcfInstance(std::wstring& instanceId, std::wstring& deviceName)
 {
@@ -1079,21 +989,15 @@ static bool FindNpcfInstance(std::wstring& instanceId, std::wstring& deviceName)
     deviceName.clear();
 
     HDEVINFO info = SetupDiGetClassDevsW(
-        nullptr,
-        nullptr,
-        nullptr,
-        DIGCF_ALLCLASSES | DIGCF_PRESENT);
-
+        nullptr, nullptr, nullptr, DIGCF_ALLCLASSES | DIGCF_PRESENT);
     if (info == INVALID_HANDLE_VALUE)
         return false;
 
-    std::vector<NpcfCandidate> candidates;
-
+    bool found = false;
     for (DWORD i = 0;; ++i)
     {
         SP_DEVINFO_DATA dev = {};
         dev.cbSize = sizeof(dev);
-
         if (!SetupDiEnumDeviceInfo(info, i, &dev))
         {
             if (GetLastError() == ERROR_NO_MORE_ITEMS)
@@ -1103,122 +1007,61 @@ static bool FindNpcfInstance(std::wstring& instanceId, std::wstring& deviceName)
 
         wchar_t idBuffer[4096] = {};
         if (!SetupDiGetDeviceInstanceIdW(
-                info,
-                &dev,
-                idBuffer,
-                _countof(idBuffer),
-                nullptr))
+                info, &dev, idBuffer, _countof(idBuffer), nullptr))
         {
             continue;
         }
 
-        std::wstring id = idBuffer;
         std::wstring name = ReadDeviceStringProperty(info, dev, SPDRP_FRIENDLYNAME);
         if (name.empty())
             name = ReadDeviceStringProperty(info, dev, SPDRP_DEVICEDESC);
 
-        const std::wstring upperId = UpperCopy(id);
-        const std::wstring upperName = UpperCopy(name);
-
-        bool knownHardwareId = false;
-        const std::vector<std::wstring> hardwareIds =
-            ReadDeviceMultiStringProperty(info, dev, SPDRP_HARDWAREID);
-
-        for (const std::wstring& hardwareId : hardwareIds)
-        {
-            const std::wstring upperHardwareId = UpperCopy(hardwareId);
-
-            if (upperHardwareId.find(L"VEN_NVDA&DEV_0820") != std::wstring::npos ||
-                upperHardwareId.find(L"ACPI\\NVDA0820") != std::wstring::npos)
-            {
-                knownHardwareId = true;
-                break;
-            }
-        }
-
-        const bool knownInstance =
-            upperId.find(L"ACPI\\NVDA0820\\") == 0 ||
-            upperId.find(L"VEN_NVDA&DEV_0820") != std::wstring::npos;
-
-        const bool knownName =
-            upperName.find(L"NVIDIA PLATFORM CONTROLLERS AND FRAMEWORK") !=
-            std::wstring::npos;
-
-        // Elevated automatic recovery must not act on a name-only match.
-        // Require the canonical NPCF name plus either its known hardware ID
-        // or its known ACPI instance form.
-        if (!knownName || (!knownHardwareId && !knownInstance))
+        if (_wcsicmp(name.c_str(), L"NVIDIA Platform Controllers and Framework") != 0)
             continue;
 
-        int score = 0;
-        if (knownName)
-            score += 100;
-        if (knownHardwareId)
-            score += 80;
-        if (knownInstance)
-            score += 60;
+        const bool nvidiaOwned =
+            _wcsnicmp(idBuffer, L"ACPI\\NVDA", 9) == 0 ||
+            wcsstr(idBuffer, L"VEN_NVDA") != nullptr ||
+            wcsstr(idBuffer, L"ven_nvda") != nullptr;
+        if (!nvidiaOwned)
+            continue;
 
-        candidates.push_back({ id, name, score });
+        // More than one distinct canonical NPCF device is ambiguous; recovery
+        // must not guess which platform controller Windows should restart.
+        if (found && _wcsicmp(instanceId.c_str(), idBuffer) != 0)
+        {
+            instanceId.clear();
+            deviceName.clear();
+            found = false;
+            break;
+        }
+
+        instanceId = idBuffer;
+        deviceName = name;
+        found = true;
     }
 
     SetupDiDestroyDeviceInfoList(info);
-
-    if (candidates.empty())
-        return false;
-
-    std::sort(
-        candidates.begin(),
-        candidates.end(),
-        [](const NpcfCandidate& a, const NpcfCandidate& b)
-        {
-            return a.score > b.score;
-        });
-
-    // Do not guess if Windows exposes two equally strong NPCF candidates.
-    if (candidates.size() > 1 &&
-        candidates[0].score == candidates[1].score &&
-        UpperCopy(candidates[0].instanceId) != UpperCopy(candidates[1].instanceId))
-    {
-        return false;
-    }
-
-    instanceId = candidates[0].instanceId;
-    deviceName = candidates[0].name.empty()
-        ? L"NVIDIA Platform Controllers and Framework"
-        : candidates[0].name;
-    return true;
-}
-
-static bool IsDeviceStarted(const std::wstring& instanceId)
-{
-    std::vector<wchar_t> id(instanceId.begin(), instanceId.end());
-    id.push_back(L'\0');
-
-    DEVINST devInst = 0;
-    CONFIGRET cr = CM_Locate_DevNodeW(&devInst, id.data(), CM_LOCATE_DEVNODE_NORMAL);
-    if (cr != CR_SUCCESS)
-        return false;
-
-    ULONG status = 0;
-    ULONG problem = 0;
-    cr = CM_Get_DevNode_Status(&status, &problem, devInst, 0);
-
-    return cr == CR_SUCCESS && (status & DN_STARTED) != 0;
+    return found;
 }
 
 static bool RestartNpcfWithPnpUtil(
     std::wstring& instanceId,
-    std::wstring& deviceName,
     DWORD& exitCode,
-    bool& deviceStarted)
+    unsigned long long generation)
 {
     instanceId.clear();
-    deviceName.clear();
     exitCode = ERROR_GEN_FAILURE;
-    deviceStarted = false;
 
+    std::wstring deviceName;
     if (!FindNpcfInstance(instanceId, deviceName))
         return false;
+
+    if (generation != g_recoveryGeneration.load(std::memory_order_acquire))
+    {
+        exitCode = ERROR_CANCELLED;
+        return false;
+    }
 
     const std::wstring pnputil = SystemExecutablePath(L"pnputil.exe");
     if (pnputil.empty())
@@ -1227,35 +1070,19 @@ static bool RestartNpcfWithPnpUtil(
     const std::wstring arguments =
         L"/restart-device \"" + instanceId + L"\"";
 
-    bool timedOut = false;
-    if (!RunHiddenProcess(
-            pnputil,
-            arguments,
-            PNPUTIL_PROCESS_TIMEOUT_MS,
-            exitCode,
-            timedOut) || exitCode != 0)
-    {
-        if (timedOut)
-            exitCode = WAIT_TIMEOUT;
-        return false;
-    }
-
-    // pnputil exit code 0 is the authoritative restart result. Configuration
-    // Manager status can lag briefly, so DN_STARTED is diagnostic only.
-    const ULONGLONG deadline = GetTickCount64() + 1500;
-    do
-    {
-        if (IsDeviceStarted(instanceId))
-        {
-            deviceStarted = true;
-            break;
-        }
-        Sleep(25);
-    }
-    while (GetTickCount64() < deadline);
-
-    return true;
+    return RunHiddenProcess(
+               pnputil,
+               arguments,
+               PNPUTIL_PROCESS_TIMEOUT_MS,
+               exitCode) &&
+        exitCode == 0;
 }
+
+// =============================================================================
+// Windows startup registration
+// =============================================================================
+
+static constexpr const wchar_t* STARTUP_TASK_NAME = L"NVIDIA PowerState Watchdog";
 
 static void RemoveLegacyScheduledTasksSilently()
 {
@@ -1263,104 +1090,61 @@ static void RemoveLegacyScheduledTasksSilently()
     if (schtasks.empty())
         return;
 
-    // Remove only task names used by older builds. Never remove the current
-    // NVIDIA PowerState Watchdog task here; it is controlled by the checkbox.
-    const wchar_t* taskNames[] =
+    // These names belong only to older builds. Deleting a missing task is
+    // harmless, so there is no need to launch a separate query first.
+    const wchar_t* legacyTaskNames[] =
     {
         L"NVIDIA VRAM Watchdog",
         L"NVIDIA Memory Watchdog"
     };
 
-    for (const wchar_t* taskName : taskNames)
+    for (const wchar_t* taskName : legacyTaskNames)
     {
-        DWORD queryCode = ERROR_GEN_FAILURE;
-        bool timedOut = false;
-        const std::wstring queryArgs = L"/Query /TN \"" + std::wstring(taskName) + L"\"";
-
-        if (!RunHiddenProcess(
-                schtasks,
-                queryArgs,
-                SCHTASKS_PROCESS_TIMEOUT_MS,
-                queryCode,
-                timedOut) ||
-            queryCode != 0)
-        {
-            continue;
-        }
-
-        DWORD deleteCode = ERROR_GEN_FAILURE;
-        timedOut = false;
-        const std::wstring deleteArgs = L"/Delete /F /TN \"" + std::wstring(taskName) + L"\"";
+        DWORD exitCode = ERROR_GEN_FAILURE;
+        const std::wstring arguments =
+            L"/Delete /F /TN \"" + std::wstring(taskName) + L"\"";
         RunHiddenProcess(
-            schtasks,
-            deleteArgs,
-            SCHTASKS_PROCESS_TIMEOUT_MS,
-            deleteCode,
-            timedOut);
+            schtasks, arguments, SCHTASKS_PROCESS_TIMEOUT_MS, exitCode);
     }
 }
 
-static bool RemoveRunStartupValuesSilently()
+static bool QueryStartupTask(bool& present)
 {
-    HKEY key = nullptr;
-    const wchar_t* runKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+    present = false;
 
-    const LSTATUS openResult = RegOpenKeyExW(
-        HKEY_CURRENT_USER,
-        runKey,
-        0,
-        KEY_QUERY_VALUE | KEY_SET_VALUE,
-        &key);
-
-    if (openResult != ERROR_SUCCESS)
-        return false;
-
-    bool currentValueExisted = false;
-    DWORD type = 0;
-    DWORD bytes = 0;
-
-    if (RegQueryValueExW(
-            key,
-            L"NVIDIA PowerState Watchdog",
-            nullptr,
-            &type,
-            nullptr,
-            &bytes) == ERROR_SUCCESS)
-    {
-        currentValueExisted = true;
-    }
-
-    // The elevated watchdog cannot be launched reliably from the normal Run
-    // key. Remove Run-key registrations from this and older builds.
-    RegDeleteValueW(key, L"NVIDIA PowerState Watchdog");
-    RegDeleteValueW(key, L"NVIDIA VRAM Watchdog");
-    RegDeleteValueW(key, L"NVIDIA Memory Watchdog");
-
-    RegCloseKey(key);
-    return currentValueExisted;
-}
-
-static bool UpdateStartupTask(bool enabled)
-{
-    const std::wstring taskName = L"NVIDIA PowerState Watchdog";
     const std::wstring schtasks = SystemExecutablePath(L"schtasks.exe");
     if (schtasks.empty())
         return false;
 
     DWORD exitCode = ERROR_GEN_FAILURE;
-    bool timedOut = false;
+    const std::wstring arguments =
+        L"/Query /TN \"" + std::wstring(STARTUP_TASK_NAME) + L"\"";
+
+    if (!RunHiddenProcess(
+            schtasks, arguments, SCHTASKS_PROCESS_TIMEOUT_MS, exitCode))
+    {
+        return false;
+    }
+
+    present = exitCode == 0;
+    return true;
+}
+
+static bool UpdateStartupTask(bool enabled)
+{
+    const std::wstring schtasks = SystemExecutablePath(L"schtasks.exe");
+    if (schtasks.empty())
+        return false;
+
+    DWORD exitCode = ERROR_GEN_FAILURE;
 
     if (!enabled)
     {
-        const std::wstring deleteArguments =
-            L"/Delete /F /TN \"" + taskName + L"\"";
+        const std::wstring arguments =
+            L"/Delete /F /TN \"" + std::wstring(STARTUP_TASK_NAME) + L"\"";
 
         if (!RunHiddenProcess(
-                schtasks,
-                deleteArguments,
-                SCHTASKS_PROCESS_TIMEOUT_MS,
-                exitCode,
-                timedOut))
+                schtasks, arguments, SCHTASKS_PROCESS_TIMEOUT_MS, exitCode))
         {
             return false;
         }
@@ -1368,46 +1152,24 @@ static bool UpdateStartupTask(bool enabled)
         if (exitCode == 0)
             return true;
 
-        // If deletion returned a non-zero code, verify that the task is
-        // actually absent before reporting failure.
-        DWORD queryExitCode = ERROR_GEN_FAILURE;
-        bool queryTimedOut = false;
-        const std::wstring queryArguments =
-            L"/Query /TN \"" + taskName + L"\"";
-
-        if (!RunHiddenProcess(
-                schtasks,
-                queryArguments,
-                SCHTASKS_PROCESS_TIMEOUT_MS,
-                queryExitCode,
-                queryTimedOut))
-        {
-            return false;
-        }
-
-        return queryExitCode != 0;
+        // Deleting an already-missing task is also a successful disabled state.
+        bool present = true;
+        return QueryStartupTask(present) && !present;
     }
 
-    const std::wstring exe = ExePath();
+    const std::wstring executable = ExePath();
+    if (executable.empty())
+        return false;
 
-    // Run at logon with highest privileges so the watchdog starts elevated
-    // without relying on the normal HKCU Run startup path.
+    // --startup tells the app to honor the Start minimized to tray setting.
     const std::wstring arguments =
         L"/Create /F /SC ONLOGON /RL HIGHEST "
-        L"/TN \"" + taskName + L"\" "
-        L"/TR \"\\\"" + exe + L"\\\" --startup\"";
+        L"/TN \"" + std::wstring(STARTUP_TASK_NAME) + L"\" "
+        L"/TR \"\\\"" + executable + L"\\\" --startup\"";
 
-    if (!RunHiddenProcess(
-            schtasks,
-            arguments,
-            SCHTASKS_PROCESS_TIMEOUT_MS,
-            exitCode,
-            timedOut))
-    {
-        return false;
-    }
-
-    return exitCode == 0;
+    return RunHiddenProcess(
+               schtasks, arguments, SCHTASKS_PROCESS_TIMEOUT_MS, exitCode) &&
+           exitCode == 0;
 }
 
 // =============================================================================
@@ -1492,10 +1254,7 @@ static void PopulateTargetComboFromCurrentList()
     for (size_t i = 0; i < g_pstateChoices.size(); ++i)
     {
         const auto& choice = g_pstateChoices[i];
-        std::wstring label = L"P" + std::to_wstring(choice.pstate);
-        if (!choice.controllable)
-            label += L" (read-only)";
-
+        const std::wstring label = L"P" + std::to_wstring(choice.pstate);
         SendMessageW(g_comboTarget, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
 
         if (choice.pstate == g_settings.targetPState)
@@ -1512,24 +1271,11 @@ static void PopulateTargetComboFromCurrentList()
         for (size_t i = 0; i < g_pstateChoices.size(); ++i)
         {
             const auto& choice = g_pstateChoices[i];
-            if (choice.controllable &&
-                g_settings.legacyTargetMHz >= choice.lockMinMHz &&
+            if (g_settings.legacyTargetMHz >= choice.lockMinMHz &&
                 g_settings.legacyTargetMHz <= choice.lockMaxMHz)
             {
                 selected = i;
                 foundTarget = true;
-                break;
-            }
-        }
-    }
-
-    if (!foundTarget)
-    {
-        for (size_t i = 0; i < g_pstateChoices.size(); ++i)
-        {
-            if (g_pstateChoices[i].controllable)
-            {
-                selected = i;
                 break;
             }
         }
@@ -1551,7 +1297,7 @@ static void FilterDeepLowPowerPStates(std::vector<PStateChoice>& choices)
     std::vector<unsigned int> clocks;
     for (const auto& choice : choices)
     {
-        if (choice.controllable && choice.lockMaxMHz > 0)
+        if (choice.lockMaxMHz > 0)
             clocks.push_back(choice.lockMaxMHz);
     }
 
@@ -1597,8 +1343,7 @@ static void FilterDeepLowPowerPStates(std::vector<PStateChoice>& choices)
             choices.end(),
             [&](const PStateChoice& choice)
             {
-                return choice.controllable &&
-                       choice.lockMaxMHz > 0 &&
+                return choice.lockMaxMHz > 0 &&
                        choice.lockMaxMHz <= firstDeepLowPowerClock;
             }),
         choices.end());
@@ -1650,33 +1395,28 @@ static bool RefreshPStateChoices(bool log)
 
     for (int pstate : pstates)
     {
-        PStateChoice choice;
-        choice.pstate = pstate;
-
+        unsigned int reportedMinMHz = 0;
+        unsigned int reportedMaxMHz = 0;
         std::string rangeError;
         if (!g_nvml.GetPStateMemoryRange(
-                pstate,
-                choice.reportedMemMinMHz,
-                choice.reportedMemMaxMHz,
-                rangeError))
+                pstate, reportedMinMHz, reportedMaxMHz, rangeError))
         {
-            g_pstateChoices.push_back(choice);
             continue;
         }
 
+        int memOffsetMHz = 0;
+        bool memOffsetAvailable = false;
         std::string offsetError;
         g_nvml.GetMemoryOffset(
-            pstate,
-            choice.memOffsetMHz,
-            choice.memOffsetAvailable,
-            offsetError);
+            pstate, memOffsetMHz, memOffsetAvailable, offsetError);
 
         auto clocksInside = [&](long long rangeMin, long long rangeMax)
         {
             std::vector<unsigned int> inside;
-            if (rangeMin < 0) rangeMin = 0;
-            if (rangeMax < 0) rangeMax = 0;
-            if (rangeMin > rangeMax) std::swap(rangeMin, rangeMax);
+            rangeMin = std::max(0ll, rangeMin);
+            rangeMax = std::max(0ll, rangeMax);
+            if (rangeMin > rangeMax)
+                std::swap(rangeMin, rangeMax);
 
             for (unsigned int clock : supportedMemClocks)
             {
@@ -1692,48 +1432,44 @@ static bool RefreshPStateChoices(bool log)
         // Different driver generations have reported P-State clock ranges with
         // and without the active VF offset folded into them. First match the
         // raw range. Only if that fails, normalize by the reported OC offset.
-        long long baseMin = static_cast<long long>(choice.reportedMemMinMHz);
-        long long baseMax = static_cast<long long>(choice.reportedMemMaxMHz);
+        long long baseMin = static_cast<long long>(reportedMinMHz);
+        long long baseMax = static_cast<long long>(reportedMaxMHz);
         std::vector<unsigned int> inside = clocksInside(baseMin, baseMax);
 
-        if (inside.empty() && choice.memOffsetAvailable && choice.memOffsetMHz != 0)
+        if (inside.empty() && memOffsetAvailable && memOffsetMHz != 0)
         {
-            baseMin = static_cast<long long>(choice.reportedMemMinMHz) - choice.memOffsetMHz;
-            baseMax = static_cast<long long>(choice.reportedMemMaxMHz) - choice.memOffsetMHz;
+            baseMin -= memOffsetMHz;
+            baseMax -= memOffsetMHz;
             inside = clocksInside(baseMin, baseMax);
         }
+
+        PStateChoice choice;
+        choice.pstate = pstate;
 
         if (!inside.empty())
         {
             choice.lockMinMHz = inside.front();
             choice.lockMaxMHz = inside.back();
-            choice.controllable = true;
         }
         else if (baseMin > 0 && baseMax > 0)
         {
             // Some drivers expose a valid P-State range without repeating each
             // endpoint in GetSupportedMemoryClocks. Keep the range as a safe
             // fallback; NVML will reject it at apply-time if it is not legal.
-            if (baseMin > baseMax) std::swap(baseMin, baseMax);
+            if (baseMin > baseMax)
+                std::swap(baseMin, baseMax);
             choice.lockMinMHz = static_cast<unsigned int>(baseMin);
             choice.lockMaxMHz = static_cast<unsigned int>(baseMax);
-            choice.controllable = true;
+        }
+        else
+        {
+            continue;
         }
 
         g_pstateChoices.push_back(choice);
     }
 
     FilterDeepLowPowerPStates(g_pstateChoices);
-
-    // The target dropdown is for states the watchdog can actually request.
-    // Read-only states remain observable through live telemetry but are not
-    // useful target choices.
-    g_pstateChoices.erase(
-        std::remove_if(
-            g_pstateChoices.begin(),
-            g_pstateChoices.end(),
-            [](const PStateChoice& choice) { return !choice.controllable; }),
-        g_pstateChoices.end());
 
     PopulateTargetComboFromCurrentList();
 
@@ -1791,7 +1527,16 @@ static bool SetPStateNow(const wchar_t* source, bool logSuccess = true, bool log
     }
 
     const PStateChoice* choice = FindPStateChoice(g_settings.targetPState);
-    if (!choice || !choice->controllable)
+    if (!choice && g_pstateChoices.empty())
+    {
+        // NVML can become ready after an early-login connection failure. Rebuild
+        // the P-State mapping lazily so automatic recovery does not remain
+        // permanently unable to control the target.
+        RefreshPStateChoices(false);
+        choice = FindPStateChoice(g_settings.targetPState);
+    }
+
+    if (!choice)
     {
         if (logFailure)
             AppendLog(L"Unable to control P" + std::to_wstring(g_settings.targetPState) + L" on this GPU.");
@@ -1809,7 +1554,9 @@ static bool SetPStateNow(const wchar_t* source, bool logSuccess = true, bool log
     if (logSuccess)
     {
         const std::wstring prefix = (source && wcscmp(source, L"Startup") == 0) ? L"Startup: " : L"";
-        AppendLog(prefix + L"P-State set to P" + std::to_wstring(g_settings.targetPState) + L".");
+        AppendLog(
+            prefix + L"target P-State requested: P" +
+            std::to_wstring(g_settings.targetPState) + L".");
     }
 
     return true;
@@ -1842,7 +1589,10 @@ static bool CurrentTargetReached()
     int pstate = -1;
     std::string error;
     if (!g_nvml.ReadPState(pstate, error))
+    {
+        g_nvmlReady = false;
         return false;
+    }
 
     return pstate == g_settings.targetPState;
 }
@@ -1853,25 +1603,34 @@ static void UpdateMainTelemetry();
 struct StateUnlockWorkerResult
 {
     std::wstring instanceId;
-    std::wstring deviceName;
     DWORD exitCode = ERROR_GEN_FAILURE;
     bool restarted = false;
-    bool deviceStarted = false;
+    unsigned long long generation = 0;
 };
 
 static unsigned __stdcall StateUnlockWorkerThread(void* parameter)
 {
-    const HWND notifyWindow = reinterpret_cast<HWND>(parameter);
-    auto* result = new StateUnlockWorkerResult();
+    auto* result = static_cast<StateUnlockWorkerResult*>(parameter);
+    if (!result)
+        return 0;
 
-    result->restarted = RestartNpcfWithPnpUtil(
-        result->instanceId,
-        result->deviceName,
-        result->exitCode,
-        result->deviceStarted);
+    // Configuration/power changes invalidate a queued recovery before pnputil
+    // starts. A restart already accepted by Windows is allowed to finish, but
+    // its result is ignored later if the generation changed.
+    if (result->generation == g_recoveryGeneration.load(std::memory_order_acquire))
+    {
+        result->restarted = RestartNpcfWithPnpUtil(
+            result->instanceId,
+            result->exitCode,
+            result->generation);
+    }
+    else
+    {
+        result->exitCode = ERROR_CANCELLED;
+    }
 
     if (!PostMessageW(
-            notifyWindow,
+            g_main,
             WM_STATE_UNLOCK_RESULT,
             0,
             reinterpret_cast<LPARAM>(result)))
@@ -1894,12 +1653,48 @@ static void ReportStateUnlockLimitIfNeeded()
     g_stateUnlockLimitReported = true;
 }
 
+static void StopRecoveryVerification()
+{
+    g_recoveryVerifyMode = RecoveryVerifyMode::None;
+    g_stateUnlockStableSamples = 0;
+    g_stateUnlockVerifyDeadline = 0;
+
+    if (g_main)
+        KillTimer(g_main, TIMER_STATE_UNLOCK_VERIFY);
+}
+
+static bool BeginRecoveryVerification(RecoveryVerifyMode mode)
+{
+    if (g_powerPaused || !g_settings.autoRestore || mode == RecoveryVerifyMode::None)
+        return false;
+
+    StopRecoveryVerification();
+
+    g_recoveryVerifyMode = mode;
+    g_stateUnlockStableSamples = 0;
+    g_stateUnlockVerifyDeadline =
+        mode == RecoveryVerifyMode::NpcfAcquireTarget
+            ? GetTickCount64() + STATE_UNLOCK_ACQUIRE_TIMEOUT_MS
+            : 0;
+
+    if (!StartMainTimer(
+            TIMER_STATE_UNLOCK_VERIFY,
+            STATE_UNLOCK_VERIFY_INTERVAL_MS,
+            L"Recovery verification timer could not be started."))
+    {
+        StopRecoveryVerification();
+        return false;
+    }
+
+    return true;
+}
+
 static bool StartStateUnlock()
 {
     if (g_powerPaused ||
         !g_settings.autoRestore ||
         g_stateUnlockWorkerRunning ||
-        g_stateUnlockVerifying ||
+        g_recoveryVerifyMode != RecoveryVerifyMode::None ||
         g_stateUnlockAttemptCount >= g_settings.unlockAttempts)
     {
         return false;
@@ -1910,8 +1705,13 @@ static bool StartStateUnlock()
     if (!SetPStateNow(L"Recovery", false, true))
         return false;
 
+    // If the normal request reached the target before the restart began, verify
+    // that it actually holds instead of restarting NPCF unnecessarily.
     if (CurrentTargetReached())
+    {
+        BeginRecoveryVerification(RecoveryVerifyMode::ConfirmObservedTarget);
         return false;
+    }
 
     const unsigned int attempt = g_stateUnlockAttemptCount + 1;
     AppendLog(
@@ -1919,16 +1719,20 @@ static bool StartStateUnlock()
         std::to_wstring(attempt) + L"/" +
         std::to_wstring(g_settings.unlockAttempts) + L").");
 
+    auto* result = new StateUnlockWorkerResult();
+    result->generation = g_recoveryGeneration.load(std::memory_order_acquire);
+
     uintptr_t thread = _beginthreadex(
         nullptr,
         0,
         StateUnlockWorkerThread,
-        reinterpret_cast<void*>(g_main),
+        result,
         0,
         nullptr);
 
     if (thread == 0)
     {
+        delete result;
         AppendLog(L"NPCF restart failed.");
         return false;
     }
@@ -1944,6 +1748,12 @@ static void HandleStateUnlockResult(StateUnlockWorkerResult* result)
 {
     g_stateUnlockWorkerRunning = false;
     if (!result)
+        return;
+
+    // Target/GPU/power state may have changed while pnputil was running. The
+    // device operation cannot safely be undone once Windows has accepted it,
+    // but stale results must never start verification or alter the new episode.
+    if (result->generation != g_recoveryGeneration.load(std::memory_order_acquire))
         return;
 
     g_nextStateUnlockAllowedTick = GetTickCount64() + POST_STATE_UNLOCK_GRACE_MS;
@@ -1964,20 +1774,12 @@ static void HandleStateUnlockResult(StateUnlockWorkerResult* result)
     if (g_powerPaused || !g_settings.autoRestore)
         return;
 
-    g_stateUnlockVerifying = true;
-    g_stateUnlockVerifyDeadline = GetTickCount64() + STATE_UNLOCK_VERIFY_TIMEOUT_MS;
-    g_stateUnlockLastObservedPState = -1;
-
-    SetTimer(
-        g_main,
-        TIMER_STATE_UNLOCK_VERIFY,
-        STATE_UNLOCK_VERIFY_INTERVAL_MS,
-        nullptr);
+    BeginRecoveryVerification(RecoveryVerifyMode::NpcfAcquireTarget);
 }
 
 static void StateUnlockVerifyTick()
 {
-    if (!g_stateUnlockVerifying)
+    if (g_recoveryVerifyMode == RecoveryVerifyMode::None)
     {
         KillTimer(g_main, TIMER_STATE_UNLOCK_VERIFY);
         return;
@@ -1985,29 +1787,20 @@ static void StateUnlockVerifyTick()
 
     if (g_powerPaused || !g_settings.autoRestore)
     {
-        g_stateUnlockVerifying = false;
-        KillTimer(g_main, TIMER_STATE_UNLOCK_VERIFY);
+        StopRecoveryVerification();
         return;
     }
+
+    const RecoveryVerifyMode mode = g_recoveryVerifyMode;
+    bool targetReached = false;
 
     if (EnsureNvml())
     {
         std::string error;
         int pstate = -1;
-
         if (g_nvml.ReadPState(pstate, error))
         {
-            g_stateUnlockLastObservedPState = pstate;
-
-            if (pstate == g_settings.targetPState)
-            {
-                g_stateUnlockVerifying = false;
-                KillTimer(g_main, TIMER_STATE_UNLOCK_VERIFY);
-                AppendLog(L"P-State restored to P" + std::to_wstring(g_settings.targetPState) + L".");
-                ResetWatchdogFailureEpisode();
-                UpdateMainTelemetry();
-                return;
-            }
+            targetReached = pstate == g_settings.targetPState;
         }
         else
         {
@@ -2015,25 +1808,53 @@ static void StateUnlockVerifyTick()
         }
     }
 
-    if (GetTickCount64() >= g_stateUnlockVerifyDeadline)
+    if (targetReached)
     {
-        g_stateUnlockVerifying = false;
-        KillTimer(g_main, TIMER_STATE_UNLOCK_VERIFY);
+        if (++g_stateUnlockStableSamples < STATE_UNLOCK_STABLE_SAMPLES_REQUIRED)
+            return;
 
-        if (g_stateUnlockLastObservedPState >= 0)
+        StopRecoveryVerification();
+        AppendLog(
+            L"P-State locked to selected target: P" +
+            std::to_wstring(g_settings.targetPState) + L".");
+        ResetWatchdogFailureEpisode();
+        UpdateMainTelemetry();
+        return;
+    }
+
+    g_stateUnlockStableSamples = 0;
+
+    // Normal confirmation starts only after the target has already been seen,
+    // so one miss cancels it. NPCF recovery gets time to acquire the target.
+    if (mode == RecoveryVerifyMode::NpcfAcquireTarget &&
+        GetTickCount64() < g_stateUnlockVerifyDeadline)
+    {
+        return;
+    }
+
+    const unsigned int completedAttempt = g_stateUnlockAttemptCount;
+    StopRecoveryVerification();
+
+    if (mode == RecoveryVerifyMode::NpcfAcquireTarget)
+    {
+        if (completedAttempt >= g_settings.unlockAttempts)
         {
             AppendLog(
-                L"Recovery failed; P-State remains P" +
-                std::to_wstring(g_stateUnlockLastObservedPState) + L".");
+                L"Selected target P" + std::to_wstring(g_settings.targetPState) +
+                L" could not be locked.");
+            ReportStateUnlockLimitIfNeeded();
         }
         else
         {
-            AppendLog(L"Recovery failed.");
+            AppendLog(
+                L"NPCF recovery attempt " + std::to_wstring(completedAttempt) +
+                L"/" + std::to_wstring(g_settings.unlockAttempts) +
+                L" did not lock selected target P" +
+                std::to_wstring(g_settings.targetPState) + L".");
         }
-
-        ReportStateUnlockLimitIfNeeded();
-        UpdateMainTelemetry();
     }
+
+    UpdateMainTelemetry();
 }
 
 static void LayoutTelemetryRows(bool showMemoryOffset)
@@ -2129,7 +1950,7 @@ static void UpdateMainTelemetry()
 
     if (g_stateUnlockWorkerRunning)
         SetWindowTextW(g_lblStatus, L"Recovering P-State");
-    else if (g_stateUnlockVerifying)
+    else if (g_recoveryVerifyMode != RecoveryVerifyMode::None)
         SetWindowTextW(g_lblStatus, L"Verifying P-State");
     else if (t.pstate == g_settings.targetPState)
         SetWindowTextW(g_lblStatus, L"Target reached");
@@ -2154,14 +1975,14 @@ static void ResetWatchdogFailureEpisode()
 
 static void ResetWatchdogStateForConfigurationChange()
 {
+    // Invalidate any NPCF worker result that belongs to the old target/GPU/power
+    // state. A worker already inside pnputil is allowed to finish, but its result
+    // is ignored and cannot affect the new configuration.
+    g_recoveryGeneration.fetch_add(1, std::memory_order_acq_rel);
+
+    StopRecoveryVerification();
     ResetWatchdogFailureEpisode();
     g_nextStateUnlockAllowedTick = 0;
-
-    if (g_stateUnlockVerifying)
-    {
-        g_stateUnlockVerifying = false;
-        KillTimer(g_main, TIMER_STATE_UNLOCK_VERIFY);
-    }
 }
 
 static void WatchdogTick()
@@ -2169,7 +1990,7 @@ static void WatchdogTick()
     if (g_powerPaused)
         return;
 
-    if (g_stateUnlockWorkerRunning || g_stateUnlockVerifying)
+    if (g_stateUnlockWorkerRunning || g_recoveryVerifyMode != RecoveryVerifyMode::None)
     {
         UpdateMainTelemetry();
         return;
@@ -2177,6 +1998,11 @@ static void WatchdogTick()
 
     if (!EnsureNvml())
         return;
+
+    // If NVML was unavailable during early startup, the connection may recover
+    // later while the P-State map is still empty. Rebuild it before enforcement.
+    if (g_pstateChoices.empty())
+        RefreshPStateChoices(false);
 
     int currentPstate = -1;
     std::string error;
@@ -2188,52 +2014,63 @@ static void WatchdogTick()
 
     const bool targetReached = currentPstate == g_settings.targetPState;
 
-    if (g_settings.autoRestore && !targetReached)
+    if (!g_settings.autoRestore)
     {
-        if (!g_watchdogTargetMismatchReported)
-        {
-            AppendLog(
-                L"P-State does not match target (actual P" +
-                std::to_wstring(currentPstate) + L", target P" +
-                std::to_wstring(g_settings.targetPState) +
-                L"); attempting recovery.");
-            g_watchdogTargetMismatchReported = true;
-        }
-
-        if (SetPStateNow(L"Recovery", false, !g_watchdogSetFailureReported))
-        {
-            g_watchdogSetFailureReported = false;
-            ++g_watchdogTargetMismatchRetries;
-        }
-        else
-        {
-            g_watchdogSetFailureReported = true;
-        }
-
-        if (g_watchdogTargetMismatchRetries >= NORMAL_LOCK_RETRIES_BEFORE_UNLOCK)
-        {
-            g_watchdogTargetMismatchRetries = 0;
-            const ULONGLONG now = GetTickCount64();
-
-            if (now >= g_nextStateUnlockAllowedTick)
-            {
-                if (g_stateUnlockAttemptCount < g_settings.unlockAttempts)
-                    StartStateUnlock();
-                else
-                    ReportStateUnlockLimitIfNeeded();
-            }
-        }
+        ResetWatchdogFailureEpisode();
+        UpdateMainTelemetry();
+        return;
     }
-    else if (targetReached)
+
+    if (targetReached)
     {
         if (g_watchdogTargetMismatchReported)
-            AppendLog(L"P-State restored to P" + std::to_wstring(g_settings.targetPState) + L".");
+            BeginRecoveryVerification(RecoveryVerifyMode::ConfirmObservedTarget);
 
-        ResetWatchdogFailureEpisode();
+        UpdateMainTelemetry();
+        return;
+    }
+
+    if (!g_watchdogTargetMismatchReported)
+    {
+        AppendLog(
+            L"P-State does not match target (actual P" +
+            std::to_wstring(currentPstate) + L", target P" +
+            std::to_wstring(g_settings.targetPState) +
+            L"); attempting recovery.");
+        g_watchdogTargetMismatchReported = true;
+    }
+
+    if (SetPStateNow(L"Recovery", false, !g_watchdogSetFailureReported))
+    {
+        g_watchdogSetFailureReported = false;
+        ++g_watchdogTargetMismatchRetries;
+
+        // A request can take effect immediately. Confirm it continuously before
+        // closing the episode; one transient target sample is never success.
+        if (CurrentTargetReached())
+        {
+            BeginRecoveryVerification(RecoveryVerifyMode::ConfirmObservedTarget);
+            UpdateMainTelemetry();
+            return;
+        }
     }
     else
     {
-        ResetWatchdogFailureEpisode();
+        g_watchdogSetFailureReported = true;
+    }
+
+    if (g_watchdogTargetMismatchRetries >= NORMAL_LOCK_RETRIES_BEFORE_UNLOCK)
+    {
+        g_watchdogTargetMismatchRetries = 0;
+        const ULONGLONG now = GetTickCount64();
+
+        if (now >= g_nextStateUnlockAllowedTick)
+        {
+            if (g_stateUnlockAttemptCount < g_settings.unlockAttempts)
+                StartStateUnlock();
+            else
+                ReportStateUnlockLimitIfNeeded();
+        }
     }
 
     UpdateMainTelemetry();
@@ -2267,6 +2104,8 @@ static void PauseWatchdogForPower(const wchar_t* reason)
         AppendLog(std::wstring(reason) + L": monitoring paused; low-power P-States will be ignored.");
 }
 
+static void CompleteWatchdogResume();
+
 static void ScheduleWatchdogResume(const wchar_t* reason)
 {
     if (g_powerResumeScheduled)
@@ -2282,7 +2121,13 @@ static void ScheduleWatchdogResume(const wchar_t* reason)
         KillTimer(g_main, TIMER_WATCHDOG);
         KillTimer(g_main, TIMER_POWER_RESUME);
         KillTimer(g_main, TIMER_STATE_UNLOCK_VERIFY);
-        SetTimer(g_main, TIMER_POWER_RESUME, POWER_RESUME_SETTLE_MS, nullptr);
+        if (!StartMainTimer(
+                TIMER_POWER_RESUME,
+                POWER_RESUME_SETTLE_MS,
+                L"Warning: resume timer could not be started; resuming immediately."))
+        {
+            g_powerResumeScheduled = false;
+        }
     }
 
     g_nvml.Close();
@@ -2294,6 +2139,11 @@ static void ScheduleWatchdogResume(const wchar_t* reason)
 
     if (reason)
         AppendLog(std::wstring(reason) + L": waiting briefly for NVIDIA driver.");
+
+    // If Windows could not create the settle timer, do not leave the watchdog
+    // permanently paused. Complete the resume path immediately.
+    if (!g_powerResumeScheduled)
+        CompleteWatchdogResume();
 }
 
 static void CompleteWatchdogResume()
@@ -2325,11 +2175,17 @@ static void CompleteWatchdogResume()
     const bool connected = ConnectNvml(false);
     bool requested = false;
 
+    if (connected && g_pstateChoices.empty())
+        RefreshPStateChoices(false);
+
     if (connected && g_settings.autoRestore)
         requested = SetPStateNow(L"Wake", false);
 
     if (g_main)
-        SetTimer(g_main, TIMER_WATCHDOG, g_settings.pollMs, nullptr);
+        StartMainTimer(
+            TIMER_WATCHDOG,
+            g_settings.pollMs,
+            L"Warning: watchdog timer could not be started.");
 
     if (connected)
     {
@@ -2350,6 +2206,24 @@ static void CompleteWatchdogResume()
 // Tray icon
 // =============================================================================
 
+static void ApplyTrayTooltip()
+{
+    g_nid.szTip[0] = L'\0';
+    if (!g_settings.showTrayTelemetry)
+        wcsncpy_s(g_nid.szTip, _countof(g_nid.szTip), L"NVIDIA PowerState Watchdog", _TRUNCATE);
+}
+
+static void UpdateTrayTooltip()
+{
+    if (!g_trayAdded)
+        return;
+
+    ApplyTrayTooltip();
+    NOTIFYICONDATAW update = g_nid;
+    update.uFlags = NIF_GUID | NIF_TIP;
+    Shell_NotifyIconW(NIM_MODIFY, &update);
+}
+
 static bool TryAddTrayIcon()
 {
     if (g_trayAdded)
@@ -2368,10 +2242,11 @@ static bool TryAddTrayIcon()
     g_nid.cbSize = sizeof(g_nid);
     g_nid.hWnd = g_main;
     g_nid.uID = 1;
-    g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_GUID;
+    g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_GUID | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAY;
     g_nid.hIcon = LoadIconW(g_instance, MAKEINTRESOURCEW(IDI_APP_ICON));
     g_nid.guidItem = g_trayIconGuid;
+    ApplyTrayTooltip();
 
     if (!Shell_NotifyIconW(NIM_ADD, &g_nid))
         return false;
@@ -2384,7 +2259,10 @@ static bool TryAddTrayIcon()
 static void EnsureTrayIcon()
 {
     if (!TryAddTrayIcon())
-        SetTimer(g_main, TIMER_TRAY_RETRY, 1500, nullptr);
+        StartMainTimer(
+            TIMER_TRAY_RETRY,
+            1500,
+            L"Warning: tray retry timer could not be started.");
 }
 
 static void RemoveTrayIcon()
@@ -2449,8 +2327,6 @@ static void ShowTrayMenu()
 // =============================================================================
 // Hover telemetry popup
 // =============================================================================
-
-static void EndHover();
 
 static bool TrayRect(RECT& rc)
 {
@@ -2928,9 +2804,11 @@ static void RefreshHoverTelemetry()
     PositionHoverWindow();
 }
 
+static void EndHover();
+
 static void BeginHover()
 {
-    if (g_hoverActive)
+    if (!g_settings.showTrayTelemetry || g_hoverActive)
         return;
 
     UpdateHoverIconRectFromTrayCallback();
@@ -2941,8 +2819,9 @@ static void BeginHover()
     g_lastHoverTelemetryTick = GetTickCount64();
     RefreshHoverTelemetry();
     // Keep hover-exit detection responsive, but telemetry itself refreshes at
-    // 4 Hz.  The captured icon rectangle stays fixed until the popup closes.
-    SetTimer(g_main, TIMER_HOVER, 100, nullptr);
+    // 4 Hz. The captured icon rectangle stays fixed until the popup closes.
+    if (!StartMainTimer(TIMER_HOVER, 100, L"Warning: tray hover timer could not be started."))
+        EndHover();
 }
 
 static void EndHover()
@@ -3020,17 +2899,6 @@ static void PushSettingsToUi()
     SetChecked(g_chkStartMinimized, g_settings.startMinimized);
 }
 
-static void SyncAutoRestoreFromUi(bool persist)
-{
-    if (!g_chkAutoRestore)
-        return;
-
-    g_settings.autoRestore = IsChecked(g_chkAutoRestore);
-
-    if (persist)
-        SaveSettings();
-}
-
 static void PullSettingsFromUi()
 {
     g_settings.gpuIndex = EditUInt(g_editGpuIndex, g_settings.gpuIndex);
@@ -3040,11 +2908,6 @@ static void PullSettingsFromUi()
 
     g_settings.unlockAttempts = EditUInt(g_editUnlockAttempts, g_settings.unlockAttempts);
     g_settings.unlockAttempts = std::clamp(g_settings.unlockAttempts, 1u, 20u);
-
-    g_settings.autoRestore = IsChecked(g_chkAutoRestore);
-    g_settings.showTrayTelemetry = IsChecked(g_chkTrayTelemetry);
-    g_settings.startWithWindows = IsChecked(g_chkStartup);
-    g_settings.startMinimized = IsChecked(g_chkStartMinimized);
 
     SetEditUInt(g_editPoll, g_settings.pollMs);
     SetEditUInt(g_editUnlockAttempts, g_settings.unlockAttempts);
@@ -3057,13 +2920,13 @@ static void BuildUi()
     MakeControl(L"STATIC", L"GPU:", SS_LEFT, 18, 18, 90, 20);
     g_lblGpu = MakeControl(L"STATIC", L"--", SS_LEFT, 120, 18, 430, 20);
 
-    g_lblPstateCaption = MakeControl(L"STATIC", L"P-State:", SS_LEFT, 18, 46, 90, 20);
+    MakeControl(L"STATIC", L"P-State:", SS_LEFT, 18, 46, 90, 20);
     g_lblPstate = MakeControl(L"STATIC", L"--", SS_LEFT, 120, 46, 90, 20);
 
-    g_lblMemCaption = MakeControl(L"STATIC", L"Memory:", SS_LEFT, 18, 74, 90, 20);
+    MakeControl(L"STATIC", L"Memory:", SS_LEFT, 18, 74, 90, 20);
     g_lblMem = MakeControl(L"STATIC", L"--", SS_LEFT, 120, 74, 120, 20);
 
-    g_lblGpuClockCaption = MakeControl(L"STATIC", L"GPU clock:", SS_LEFT, 250, 74, 90, 20);
+    MakeControl(L"STATIC", L"GPU clock:", SS_LEFT, 250, 74, 90, 20);
     g_lblGpuClock = MakeControl(L"STATIC", L"--", SS_LEFT, 350, 74, 120, 20);
 
     g_lblMemOcCaption = MakeControl(L"STATIC", L"Memory OC:", SS_LEFT, 18, 98, 90, 20);
@@ -3317,8 +3180,6 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         switch (LOWORD(wParam))
         {
         case ID_SET_PSTATE:
-            PullSettingsFromUi();
-            SaveSettings();
             ResetWatchdogStateForConfigurationChange();
 
             if (SetPStateNow(L"UI"))
@@ -3329,10 +3190,6 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             return 0;
 
         case ID_RESET_PSTATE:
-            // The Auto Restore checkbox is a live control. Sync it before the
-            // reset so an unchecked box cannot be ignored by a stale in-memory
-            // setting and immediately reapply the P-State on the next tick.
-            SyncAutoRestoreFromUi(true);
             ResetWatchdogStateForConfigurationChange();
 
             if (ResetPStateNow())
@@ -3360,16 +3217,35 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         case ID_AUTO_RESTORE:
             if (HIWORD(wParam) == BN_CLICKED)
             {
-                SyncAutoRestoreFromUi(true);
-
+                g_settings.autoRestore = IsChecked(g_chkAutoRestore);
+                SaveSettings();
                 ResetWatchdogStateForConfigurationChange();
 
-                // When enabling it, let the option behave immediately instead
-                // of waiting for the next watchdog tick.
                 if (g_settings.autoRestore && !CurrentTargetReached())
                     SetPStateNow(L"Auto Restore", false);
 
                 UpdateMainTelemetry();
+            }
+            return 0;
+
+        case ID_TRAY_TELEMETRY:
+            if (HIWORD(wParam) == BN_CLICKED)
+            {
+                g_settings.showTrayTelemetry = IsChecked(g_chkTrayTelemetry);
+                SaveSettings();
+
+                if (!g_settings.showTrayTelemetry)
+                    EndHover();
+
+                UpdateTrayTooltip();
+            }
+            return 0;
+
+        case ID_START_MINIMIZED:
+            if (HIWORD(wParam) == BN_CLICKED)
+            {
+                g_settings.startMinimized = IsChecked(g_chkStartMinimized);
+                SaveSettings();
             }
             return 0;
 
@@ -3391,8 +3267,8 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 }
                 else
                 {
-                    // Keep the UI and saved setting truthful if task creation
-                    // or deletion fails.
+                    // If task creation/deletion fails, put the checkbox back
+                    // so the UI and saved setting remain truthful.
                     SetChecked(g_chkStartup, previous);
 
                     AppendLog(
@@ -3413,7 +3289,10 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
             KillTimer(g_main, TIMER_WATCHDOG);
             if (!g_powerPaused)
-                SetTimer(g_main, TIMER_WATCHDOG, g_settings.pollMs, nullptr);
+                StartMainTimer(
+                    TIMER_WATCHDOG,
+                    g_settings.pollMs,
+                    L"Warning: watchdog timer could not be started.");
 
             if (oldGpuIndex != g_settings.gpuIndex)
             {
@@ -3437,7 +3316,6 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
         case ID_TRAY_SETRESET:
             EndHover();
-            SyncAutoRestoreFromUi(true);
             ResetWatchdogStateForConfigurationChange();
 
             if (CurrentTargetReached())
@@ -3565,15 +3443,14 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR cmdLine, int nCmdSh
     }
 
     LoadSettings();
-
-    // Migrate the short-lived Run-key implementation to the elevated scheduled
-    // task once. After migration, the Start with Windows checkbox exclusively
-    // creates or deletes the current task.
-    const bool hadRunStartup = RemoveRunStartupValuesSilently();
     RemoveLegacyScheduledTasksSilently();
 
-    if (hadRunStartup && g_settings.startWithWindows)
-        UpdateStartupTask(true);
+    // The scheduled task is the source of truth for Start with Windows.
+    // Do not silently modify it here; the checkbox remains the only control
+    // that creates or deletes the current startup task.
+    bool startupTaskPresent = false;
+    const bool startupTaskQueryOk = QueryStartupTask(startupTaskPresent);
+    g_settings.startWithWindows = startupTaskQueryOk && startupTaskPresent;
 
     INITCOMMONCONTROLSEX icc = {};
     icc.dwSize = sizeof(icc);
@@ -3630,6 +3507,13 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR cmdLine, int nCmdSh
 
     BuildUi();
 
+    if (!startupTaskQueryOk)
+    {
+        AppendLog(
+            L"Could not verify the Windows startup task; "
+            L"Start with Windows is shown disabled.");
+    }
+
     // Explicit Modern Standby / display-state notifications. Modern Standby is
     // S0 low-power idle, so classic PBT_APMSUSPEND alone is not sufficient.
     g_suspendResumeNotify = RegisterSuspendResumeNotification(
@@ -3678,7 +3562,10 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR cmdLine, int nCmdSh
     EnsureTrayIcon();
 
     if (!g_powerPaused)
-        SetTimer(g_main, TIMER_WATCHDOG, g_settings.pollMs, nullptr);
+        StartMainTimer(
+            TIMER_WATCHDOG,
+            g_settings.pollMs,
+            L"Warning: watchdog timer could not be started.");
 
     const bool startupLaunch = wcsstr(cmdLine, L"--startup") != nullptr;
 

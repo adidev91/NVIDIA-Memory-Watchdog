@@ -1,4 +1,4 @@
-NVIDIA PowerState Watchdog — Production Audit
+NVIDIA PowerState Watchdog - Production Audit
 =============================================
 
 Core behavior
@@ -6,51 +6,85 @@ Core behavior
 - Watchdog target is the GPU P-State, not memory-clock equality.
 - Supported P-States are discovered dynamically through NVML.
 - Per-P-State memory ranges are queried dynamically.
-- Legal NVML memory lock clocks are mapped to each P-State at runtime.
+- Legal NVML memory lock clocks are mapped to each usable P-State at runtime.
+- Deep low-power states are filtered from target choices by clock-table separation rather than fixed P-State numbers.
 - Overclock/underclock offset is telemetry only and never causes recovery by itself.
-- Normal recovery is attempted before NPCF restart.
+- GPU/core clock remains dynamically controlled by the NVIDIA driver.
+
+Recovery
+--------
+- Normal NVML recovery is attempted before NPCF restart.
 - Target request is pre-armed before NPCF restart.
+- NPCF restart attempts are tracked across one continuous recovery episode.
+- A single target-P-State sample is not considered recovery success.
+- Successful recovery requires consecutive target-P-State verification samples.
+- Normal recovery and NPCF recovery use the same stable-target success criteria.
+- Verification acquisition and confirmation timing are handled separately so a late target transition cannot time out halfway through stability confirmation.
+- Recovery state is reset only after stable success or an explicit configuration/power transition.
+- Stale NPCF worker results are generation-checked and ignored after target/GPU/power changes.
 - RTX display adapter is never restarted or removed.
 
-Overclock handling
-------------------
-- Uses nvmlDeviceGetClockOffsets when available.
-- Falls back to nvmlDeviceGetMemClkVfOffset on older drivers.
-- Mapping first tries raw P-State ranges, then offset-normalized ranges when needed.
-- Current P-State remains the authoritative watchdog health check.
+NVML / startup timing
+---------------------
+- If NVML is unavailable during early login and reconnects later, P-State mappings are rebuilt lazily before enforcement.
+- Wake/resume also rebuilds P-State mappings when necessary.
+- Timer creation failures are checked and logged instead of silently leaving monitoring or verification stuck.
+
+NPCF discovery
+--------------
+- NPCF matching requires the canonical NVIDIA Platform Controllers and Framework device name.
+- Matching also requires NVIDIA ACPI/PCI identity.
+- Detection is not hard-coded to ACPI\\NVDA0820 only.
+- Multiple distinct canonical NPCF matches are rejected rather than guessing which device to restart.
 
 Power handling
 --------------
 - Monitoring pauses for display-off / standby.
 - NVML handle is closed during low-power state.
 - Low-power P-States are ignored while paused.
-- Selected P-State policy is reapplied after display-on/resume.
+- Recovery state is invalidated across suspend/display transitions.
+- Late results from a recovery worker started before a state/configuration change cannot restart verification or mutate the new episode.
 
 Startup
 -------
-- Legacy scheduled tasks are detected and removed silently.
-- Start with Windows uses HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run.
-- No startup migration chatter is written to the event log.
+- Start with Windows is off by default.
+- Start with Windows uses an elevated ONLOGON scheduled task.
+- Checking Start with Windows creates/updates the task immediately.
+- Unchecking Start with Windows deletes the task immediately.
+- Save Settings does not create, update, or delete the startup task.
+- On launch, Task Scheduler is queried for the current task name; checking the box recreates the task with the current executable path, --startup, ONLOGON trigger, and highest run level.
+- Legacy NVIDIA VRAM Watchdog / NVIDIA Memory Watchdog task names are removed silently.
+
+Settings
+--------
+- Automatically restore selected P-State if it changes is off by default on a fresh install.
+- Existing saved user settings remain authoritative once present.
 
 Tray
 ----
 - Tray menu uses Set P-State / Reset P-State.
-- Hover card is dark/rounded and no-activate.
-- Hover remains active only while cursor is within this app's exact tray icon rectangle.
-- Telemetry includes P-State, target P-State, memory, optional memory OC, GPU clock, power and temperature.
+- Hover card is dark/rounded, no-activate, and click-through.
+- Hover is not created when tray telemetry is disabled.
+- Telemetry includes P-State, memory, optional memory OC, GPU clock, power, and temperature.
 
 Logging
 -------
-- Full date + time: [YYYY-MM-DD HH:MM:SS].
-- No Watchdog: prefix.
+- Full local date + time: [YYYY-MM-DD HH:MM:SS].
+- Recovery success wording is: P-State locked to selected target: P<target>.
+- A target request is not logged as if the target had already been observed.
+- Recovery failure and success cannot be emitted from the same stale verification state.
 - No State Unlock Successful/Failed wording.
-- No settings-save, target-selection, checkbox, tray-hover, or per-poll spam.
 
 Security / safety
 -----------------
 - nvml.dll: System32 only.
 - pnputil.exe: absolute System32 path.
 - pnputil hard timeout retained.
-- NPCF discovery remains conservative.
 - /remove-device implementation: 0.
 - NVIDIA display-adapter restart implementation: 0.
+- No forced termination of active 3D applications.
+
+UI settings
+-----------
+- Auto Restore, Start with Windows, Show telemetry, and Start minimized are persisted immediately when changed.
+- With tray telemetry disabled, no custom hover window is shown; the native tray tooltip shows NVIDIA PowerState Watchdog.
