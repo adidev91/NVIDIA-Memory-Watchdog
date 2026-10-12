@@ -1,44 +1,56 @@
-NVIDIA VRAM Watchdog - Production Audit
-========================================
+NVIDIA PowerState Watchdog — Production Audit
+=============================================
 
-Source base
------------
-NvidiaMemoryWatchdog_NPCFRecovery_VS2022.zip (latest supplied NPCF watchdog)
+Core behavior
+-------------
+- Watchdog target is the GPU P-State, not memory-clock equality.
+- Supported P-States are discovered dynamically through NVML.
+- Per-P-State memory ranges are queried dynamically.
+- Legal NVML memory lock clocks are mapped to each P-State at runtime.
+- Overclock/underclock offset is telemetry only and never causes recovery by itself.
+- Normal recovery is attempted before NPCF restart.
+- Target request is pre-armed before NPCF restart.
+- RTX display adapter is never restarted or removed.
 
-Implemented production changes
-------------------------------
-1. Exact target verification with 1 MHz tolerance (fixes 11001/9001 targets).
-2. NPCF State Unlock moved off the GUI thread.
-3. Post-restart verification moved to a 100 ms UI timer (no blocking Sleep loop).
-4. pnputil.exe and schtasks.exe have 15-second hard process timeouts.
-5. nvml.dll loads only from System32.
-6. pnputil.exe and schtasks.exe launch by absolute System32 path via lpApplicationName.
-7. Successful State Unlock no longer clears the global 5-second restart cooldown.
-8. NPCF matching requires canonical device name plus known hardware/instance signature.
-9. User-configurable Unlock attempts (1-20, default 3).
-10. Removed Hide to Tray button and duplicate in-client app title.
-11. Telemetry/static/check-box backgrounds use the window background instead of gray blocks.
-12. Startup-task delete is verified when schtasks reports a non-zero delete result.
-13. BUILD_RELEASE.bat performs a clean Release Rebuild and verifies the EXE exists.
+Overclock handling
+------------------
+- Uses nvmlDeviceGetClockOffsets when available.
+- Falls back to nvmlDeviceGetMemClkVfOffset on older drivers.
+- Mapping first tries raw P-State ranges, then offset-normalized ranges when needed.
+- Current P-State remains the authoritative watchdog health check.
 
-Recovery safety scan
---------------------
-- /remove-device occurrences: 0
-- RTX display-adapter restart implementation: 0
-- /restart-device occurrences: 1
-- That restart target comes only from strict NPCF discovery.
-- Infinite process waits: 0
-- Plain LoadLibraryW("nvml.dll") fallback: 0
+Power handling
+--------------
+- Monitoring pauses for display-off / standby.
+- NVML handle is closed during low-power state.
+- Low-power P-States are ignored while paused.
+- Selected P-State policy is reapplied after display-on/resume.
 
-Static validation performed in the build environment
-----------------------------------------------------
-- C++ delimiter/string/comment lexical balance: PASS
-- Visual Studio project XML parse: PASS
-- Requested production-hardening source-pattern checks: PASS
-- Archive integrity: run before packaging
+Startup
+-------
+- Legacy scheduled tasks are detected and removed silently.
+- Start with Windows uses HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run.
+- No startup migration chatter is written to the event log.
 
-Important compile note
-----------------------
-The packaging environment is Linux and does not contain the Microsoft Windows SDK/MSVC,
-so the definitive compiler/linker validation must be performed by BUILD_RELEASE.bat on
-Windows with Visual Studio 2022 Build Tools.
+Tray
+----
+- Tray menu uses Set P-State / Reset P-State.
+- Hover card is dark/rounded and no-activate.
+- Hover remains active only while cursor is within this app's exact tray icon rectangle.
+- Telemetry includes P-State, target P-State, memory, optional memory OC, GPU clock, power and temperature.
+
+Logging
+-------
+- Full date + time: [YYYY-MM-DD HH:MM:SS].
+- No Watchdog: prefix.
+- No State Unlock Successful/Failed wording.
+- No settings-save, target-selection, checkbox, tray-hover, or per-poll spam.
+
+Security / safety
+-----------------
+- nvml.dll: System32 only.
+- pnputil.exe: absolute System32 path.
+- pnputil hard timeout retained.
+- NPCF discovery remains conservative.
+- /remove-device implementation: 0.
+- NVIDIA display-adapter restart implementation: 0.

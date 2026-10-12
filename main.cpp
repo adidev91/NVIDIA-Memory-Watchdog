@@ -9,9 +9,11 @@
 #include <commctrl.h>
 #include <setupapi.h>
 #include <cfgmgr32.h>
+#include <dwmapi.h>
 
 #include <algorithm>
 #include <fstream>
+#include <functional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -26,6 +28,8 @@
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "cfgmgr32.lib")
+#pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "advapi32.lib")
 
 // =============================================================================
 // Minimal NVML declarations.
@@ -37,15 +41,35 @@ struct nvmlDevice_st;
 using nvmlDevice_t = nvmlDevice_st*;
 
 constexpr nvmlReturn_t NVML_SUCCESS = 0;
+constexpr nvmlReturn_t NVML_ERROR_NOT_SUPPORTED = 3;
 constexpr int NVML_CLOCK_GRAPHICS = 0;
 constexpr int NVML_CLOCK_MEM = 2;
+constexpr int NVML_PSTATE_UNKNOWN = 32;
+constexpr unsigned int NVML_MAX_GPU_PERF_PSTATES = 16;
 constexpr unsigned int NVML_TEMPERATURE_GPU = 0;
+
+struct nvmlClockOffset_v1_t
+{
+    unsigned int version;
+    int type;
+    int pstate;
+    int clockOffsetMHz;
+    int minClockOffsetMHz;
+    int maxClockOffsetMHz;
+};
+
+constexpr unsigned int NVML_CLOCK_OFFSET_V1 =
+    (1u << 24) | static_cast<unsigned int>(sizeof(nvmlClockOffset_v1_t));
 
 using PFN_nvmlInit_v2                       = nvmlReturn_t (*)();
 using PFN_nvmlShutdown                      = nvmlReturn_t (*)();
 using PFN_nvmlDeviceGetHandleByIndex_v2     = nvmlReturn_t (*)(unsigned int, nvmlDevice_t*);
 using PFN_nvmlDeviceGetClockInfo            = nvmlReturn_t (*)(nvmlDevice_t, int, unsigned int*);
 using PFN_nvmlDeviceGetSupportedMemoryClocks = nvmlReturn_t (*)(nvmlDevice_t, unsigned int*, unsigned int*);
+using PFN_nvmlDeviceGetSupportedPerformanceStates = nvmlReturn_t (*)(nvmlDevice_t, int*, unsigned int);
+using PFN_nvmlDeviceGetMinMaxClockOfPState = nvmlReturn_t (*)(nvmlDevice_t, int, int, unsigned int*, unsigned int*);
+using PFN_nvmlDeviceGetClockOffsets         = nvmlReturn_t (*)(nvmlDevice_t, nvmlClockOffset_v1_t*);
+using PFN_nvmlDeviceGetMemClkVfOffset       = nvmlReturn_t (*)(nvmlDevice_t, int*);
 using PFN_nvmlDeviceGetPerformanceState     = nvmlReturn_t (*)(nvmlDevice_t, int*);
 using PFN_nvmlDeviceGetPowerUsage            = nvmlReturn_t (*)(nvmlDevice_t, unsigned int*);
 using PFN_nvmlDeviceGetTemperature           = nvmlReturn_t (*)(nvmlDevice_t, unsigned int, unsigned int*);
@@ -59,8 +83,22 @@ struct Telemetry
     unsigned int memMHz = 0;
     unsigned int gpuMHz = 0;
     int pstate = -1;
+    int memOffsetMHz = 0;
+    bool memOffsetAvailable = false;
     double watts = -1.0;
     int tempC = -1;
+};
+
+struct PStateChoice
+{
+    int pstate = -1;
+    unsigned int reportedMemMinMHz = 0;
+    unsigned int reportedMemMaxMHz = 0;
+    unsigned int lockMinMHz = 0;
+    unsigned int lockMaxMHz = 0;
+    int memOffsetMHz = 0;
+    bool memOffsetAvailable = false;
+    bool controllable = false;
 };
 
 class Nvml
@@ -85,6 +123,10 @@ public:
         getHandle_  = Load<PFN_nvmlDeviceGetHandleByIndex_v2>("nvmlDeviceGetHandleByIndex_v2");
         getClock_   = Load<PFN_nvmlDeviceGetClockInfo>("nvmlDeviceGetClockInfo");
         getSupportedMemClocks_ = Load<PFN_nvmlDeviceGetSupportedMemoryClocks>("nvmlDeviceGetSupportedMemoryClocks");
+        getSupportedPstates_ = Load<PFN_nvmlDeviceGetSupportedPerformanceStates>("nvmlDeviceGetSupportedPerformanceStates");
+        getMinMaxClockOfPstate_ = Load<PFN_nvmlDeviceGetMinMaxClockOfPState>("nvmlDeviceGetMinMaxClockOfPState");
+        getClockOffsets_ = Load<PFN_nvmlDeviceGetClockOffsets>("nvmlDeviceGetClockOffsets");
+        getMemClkVfOffset_ = Load<PFN_nvmlDeviceGetMemClkVfOffset>("nvmlDeviceGetMemClkVfOffset");
         getPstate_  = Load<PFN_nvmlDeviceGetPerformanceState>("nvmlDeviceGetPerformanceState");
         getPower_   = Load<PFN_nvmlDeviceGetPowerUsage>("nvmlDeviceGetPowerUsage");
         getTemp_    = Load<PFN_nvmlDeviceGetTemperature>("nvmlDeviceGetTemperature");
@@ -152,6 +194,10 @@ public:
         getHandle_ = nullptr;
         getClock_ = nullptr;
         getSupportedMemClocks_ = nullptr;
+        getSupportedPstates_ = nullptr;
+        getMinMaxClockOfPstate_ = nullptr;
+        getClockOffsets_ = nullptr;
+        getMemClkVfOffset_ = nullptr;
         getPstate_ = nullptr;
         getPower_ = nullptr;
         getTemp_ = nullptr;
@@ -183,6 +229,132 @@ public:
         return true;
     }
 
+    bool ReadPState(int& pstate, std::string& error)
+    {
+        pstate = -1;
+        if (!device_)
+        {
+            error = "NVML is not connected.";
+            return false;
+        }
+
+        nvmlReturn_t r = getPstate_(device_, &pstate);
+        if (r != NVML_SUCCESS)
+        {
+            error = "P-State query failed: " + Error(r);
+            return false;
+        }
+        return true;
+    }
+
+    bool GetSupportedPStates(std::vector<int>& pstates, std::string& error)
+    {
+        pstates.clear();
+        if (!device_)
+        {
+            error = "NVML is not connected.";
+            return false;
+        }
+        if (!getSupportedPstates_)
+        {
+            error = "Supported P-State query is not available in this NVML driver.";
+            return false;
+        }
+
+        int values[NVML_MAX_GPU_PERF_PSTATES] = {};
+        for (auto& value : values)
+            value = NVML_PSTATE_UNKNOWN;
+
+        nvmlReturn_t r = getSupportedPstates_(device_, values, static_cast<unsigned int>(sizeof(values)));
+        if (r != NVML_SUCCESS)
+        {
+            error = "Supported P-State query failed: " + Error(r);
+            return false;
+        }
+
+        for (int value : values)
+        {
+            if (value == NVML_PSTATE_UNKNOWN)
+                break;
+            if (value >= 0 && value <= 15)
+                pstates.push_back(value);
+        }
+
+        return !pstates.empty();
+    }
+
+    bool GetPStateMemoryRange(int pstate, unsigned int& minMHz, unsigned int& maxMHz, std::string& error)
+    {
+        minMHz = 0;
+        maxMHz = 0;
+        if (!device_)
+        {
+            error = "NVML is not connected.";
+            return false;
+        }
+        if (!getMinMaxClockOfPstate_)
+        {
+            error = "P-State clock-range query is not available in this NVML driver.";
+            return false;
+        }
+
+        nvmlReturn_t r = getMinMaxClockOfPstate_(device_, NVML_CLOCK_MEM, pstate, &minMHz, &maxMHz);
+        if (r != NVML_SUCCESS)
+        {
+            error = "P-State memory range query failed: " + Error(r);
+            return false;
+        }
+        return true;
+    }
+
+    bool GetMemoryOffset(int pstate, int& offsetMHz, bool& supported, std::string& error)
+    {
+        offsetMHz = 0;
+        supported = false;
+        if (!device_)
+        {
+            error = "NVML is not connected.";
+            return false;
+        }
+
+        if (getClockOffsets_)
+        {
+            nvmlClockOffset_v1_t info = {};
+            info.version = NVML_CLOCK_OFFSET_V1;
+            info.type = NVML_CLOCK_MEM;
+            info.pstate = pstate;
+
+            nvmlReturn_t r = getClockOffsets_(device_, &info);
+            if (r == NVML_SUCCESS)
+            {
+                offsetMHz = info.clockOffsetMHz;
+                supported = true;
+                return true;
+            }
+            if (r != NVML_ERROR_NOT_SUPPORTED)
+                error = "Memory clock-offset query failed: " + Error(r);
+        }
+
+        // Older drivers expose a global memory VF offset API. It is a useful
+        // fallback for display/mapping when the newer per-P-State API is absent.
+        if (getMemClkVfOffset_)
+        {
+            int legacyOffset = 0;
+            nvmlReturn_t r = getMemClkVfOffset_(device_, &legacyOffset);
+            if (r == NVML_SUCCESS)
+            {
+                offsetMHz = legacyOffset;
+                supported = true;
+                return true;
+            }
+            if (r != NVML_ERROR_NOT_SUPPORTED && error.empty())
+                error = "Memory clock-offset query failed: " + Error(r);
+        }
+
+        // Unsupported is not a watchdog failure. P-State monitoring still works.
+        return true;
+    }
+
     bool ReadTelemetry(Telemetry& t, std::string& error)
     {
         t = {};
@@ -197,7 +369,11 @@ public:
 
         int pstate = -1;
         if (getPstate_(device_, &pstate) == NVML_SUCCESS)
+        {
             t.pstate = pstate;
+            std::string offsetError;
+            GetMemoryOffset(pstate, t.memOffsetMHz, t.memOffsetAvailable, offsetError);
+        }
 
         if (getPower_)
         {
@@ -234,7 +410,7 @@ public:
 
         // Query the complete supported list. NVML reports the required count
         // when called with a null output buffer. We intentionally scan every
-        // supported memory clock, then sort and expose only the top three in UI.
+        // supported memory clock, then sort and use the full list internally for P-State mapping.
         unsigned int count = 0;
         nvmlReturn_t r = getSupportedMemClocks_(device_, &count, nullptr);
 
@@ -261,7 +437,7 @@ public:
         return !clocksMHz.empty();
     }
 
-    bool SetMemory(unsigned int mhz, std::string& error)
+    bool SetMemoryRange(unsigned int minMHz, unsigned int maxMHz, std::string& error)
     {
         if (!device_)
         {
@@ -269,10 +445,10 @@ public:
             return false;
         }
 
-        nvmlReturn_t r = setMem_(device_, mhz, mhz);
+        nvmlReturn_t r = setMem_(device_, minMHz, maxMHz);
         if (r != NVML_SUCCESS)
         {
-            error = "Set memory clock failed: " + Error(r);
+            error = Error(r);
             return false;
         }
 
@@ -290,7 +466,7 @@ public:
         nvmlReturn_t r = resetMem_(device_);
         if (r != NVML_SUCCESS)
         {
-            error = "Reset memory clock failed: " + Error(r);
+            error = Error(r);
             return false;
         }
 
@@ -325,6 +501,10 @@ private:
     PFN_nvmlDeviceGetHandleByIndex_v2 getHandle_ = nullptr;
     PFN_nvmlDeviceGetClockInfo getClock_ = nullptr;
     PFN_nvmlDeviceGetSupportedMemoryClocks getSupportedMemClocks_ = nullptr;
+    PFN_nvmlDeviceGetSupportedPerformanceStates getSupportedPstates_ = nullptr;
+    PFN_nvmlDeviceGetMinMaxClockOfPState getMinMaxClockOfPstate_ = nullptr;
+    PFN_nvmlDeviceGetClockOffsets getClockOffsets_ = nullptr;
+    PFN_nvmlDeviceGetMemClkVfOffset getMemClkVfOffset_ = nullptr;
     PFN_nvmlDeviceGetPerformanceState getPstate_ = nullptr;
     PFN_nvmlDeviceGetPowerUsage getPower_ = nullptr;
     PFN_nvmlDeviceGetTemperature getTemp_ = nullptr;
@@ -341,8 +521,8 @@ private:
 struct Settings
 {
     unsigned int gpuIndex = 0;
-    unsigned int targetMHz = 14001;
-    unsigned int targetRank = 0; // 0 = highest, 1 = second, 2 = third
+    int targetPState = 0;
+    unsigned int legacyTargetMHz = 0;
     unsigned int pollMs = 500;
     unsigned int unlockAttempts = 3;
 
@@ -354,31 +534,56 @@ struct Settings
 
 static Settings g_settings;
 
-static std::wstring SettingsPath()
+static std::wstring LocalAppDataPath(const wchar_t* subdir)
 {
     wchar_t buf[32768] = {};
     DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", buf, 32768);
-
     std::wstring dir = (n > 0 && n < 32768) ? std::wstring(buf) : L".";
-    dir += L"\\NvidiaMemoryWatchdog";
-    CreateDirectoryW(dir.c_str(), nullptr);
+    dir += L"\\";
+    dir += subdir;
+    return dir;
+}
 
+static std::wstring SettingsPath()
+{
+    std::wstring dir = LocalAppDataPath(L"NvidiaPowerStateWatchdog");
+    CreateDirectoryW(dir.c_str(), nullptr);
     return dir + L"\\settings.ini";
+}
+
+static std::wstring LegacySettingsPath()
+{
+    return LocalAppDataPath(L"NvidiaMemoryWatchdog") + L"\\settings.ini";
+}
+
+static bool FileExists(const std::wstring& path)
+{
+    const DWORD attr = GetFileAttributesW(path.c_str());
+    return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) == 0;
 }
 
 static void LoadSettings()
 {
-    const std::wstring ini = SettingsPath();
+    const std::wstring current = SettingsPath();
+    const std::wstring legacy = LegacySettingsPath();
+    const bool useLegacy = !FileExists(current) && FileExists(legacy);
+    const std::wstring ini = useLegacy ? legacy : current;
 
     g_settings.gpuIndex =
         static_cast<unsigned int>(GetPrivateProfileIntW(L"Watchdog", L"GpuIndex", 0, ini.c_str()));
 
-    g_settings.targetMHz =
-        static_cast<unsigned int>(GetPrivateProfileIntW(L"Watchdog", L"TargetMHz", 14001, ini.c_str()));
-
-    g_settings.targetRank =
-        static_cast<unsigned int>(GetPrivateProfileIntW(L"Watchdog", L"TargetRank", 0, ini.c_str()));
-    g_settings.targetRank = std::min(g_settings.targetRank, 2u);
+    if (useLegacy)
+    {
+        g_settings.targetPState = -1;
+        g_settings.legacyTargetMHz =
+            static_cast<unsigned int>(GetPrivateProfileIntW(L"Watchdog", L"TargetMHz", 0, ini.c_str()));
+    }
+    else
+    {
+        g_settings.targetPState =
+            GetPrivateProfileIntW(L"Watchdog", L"TargetPState", 0, ini.c_str());
+        g_settings.targetPState = std::clamp(g_settings.targetPState, 0, 15);
+    }
 
     g_settings.pollMs =
         static_cast<unsigned int>(GetPrivateProfileIntW(L"Watchdog", L"PollMs", 500, ini.c_str()));
@@ -406,7 +611,14 @@ static void SaveSettings()
 {
     const std::wstring ini = SettingsPath();
 
-    auto PutInt = [&](const wchar_t* key, unsigned int value)
+    auto PutInt = [&](const wchar_t* key, int value)
+    {
+        wchar_t buf[32] = {};
+        swprintf_s(buf, L"%d", value);
+        WritePrivateProfileStringW(L"Watchdog", key, buf, ini.c_str());
+    };
+
+    auto PutUInt = [&](const wchar_t* key, unsigned int value)
     {
         wchar_t buf[32] = {};
         swprintf_s(buf, L"%u", value);
@@ -418,11 +630,10 @@ static void SaveSettings()
         WritePrivateProfileStringW(L"Watchdog", key, value ? L"1" : L"0", ini.c_str());
     };
 
-    PutInt(L"GpuIndex", g_settings.gpuIndex);
-    PutInt(L"TargetMHz", g_settings.targetMHz);
-    PutInt(L"TargetRank", g_settings.targetRank);
-    PutInt(L"PollMs", g_settings.pollMs);
-    PutInt(L"UnlockAttempts", g_settings.unlockAttempts);
+    PutUInt(L"GpuIndex", g_settings.gpuIndex);
+    PutInt(L"TargetPState", g_settings.targetPState);
+    PutUInt(L"PollMs", g_settings.pollMs);
+    PutUInt(L"UnlockAttempts", g_settings.unlockAttempts);
 
     PutBool(L"AutoRestore", g_settings.autoRestore);
     PutBool(L"ShowTrayTelemetry", g_settings.showTrayTelemetry);
@@ -439,11 +650,19 @@ static HWND g_main = nullptr;
 static HWND g_hover = nullptr;
 
 static HWND g_lblGpu = nullptr;
-static HWND g_lblMem = nullptr;
-static HWND g_lblGpuClock = nullptr;
+static HWND g_lblPstateCaption = nullptr;
 static HWND g_lblPstate = nullptr;
+static HWND g_lblMemCaption = nullptr;
+static HWND g_lblMem = nullptr;
+static HWND g_lblMemOcCaption = nullptr;
+static HWND g_lblMemOc = nullptr;
+static HWND g_lblGpuClockCaption = nullptr;
+static HWND g_lblGpuClock = nullptr;
+static HWND g_lblPowerCaption = nullptr;
 static HWND g_lblPower = nullptr;
+static HWND g_lblTempCaption = nullptr;
 static HWND g_lblTemp = nullptr;
+static HWND g_lblStatusCaption = nullptr;
 static HWND g_lblStatus = nullptr;
 
 static HWND g_editGpuIndex = nullptr;
@@ -459,6 +678,8 @@ static HWND g_chkStartMinimized = nullptr;
 static HWND g_log = nullptr;
 
 static HFONT g_font = nullptr;
+static HFONT g_hoverFont = nullptr;
+static HFONT g_hoverHeaderFont = nullptr;
 
 static Nvml g_nvml;
 static bool g_nvmlReady = false;
@@ -474,14 +695,29 @@ static const GUID g_trayIconGuid =
 static UINT g_taskbarCreatedMsg = 0;
 static UINT g_showExistingMsg = 0;
 
+struct HoverRow
+{
+    std::wstring label;
+    std::wstring value;
+};
+
 static bool g_hoverActive = false;
-static POINT g_hoverAnchor = {};
-static bool g_hoverAnchorValid = false;
-static std::wstring g_hoverText = L"NVIDIA VRAM Watchdog";
+static std::vector<HoverRow> g_hoverRows;
+static std::wstring g_hoverMessage;
+static RECT g_hoverIconRect = {};
+static bool g_hoverIconRectValid = false;
+// The hover rectangle is captured once when OUR notification icon first sends
+// WM_MOUSEMOVE.  It remains fixed for the lifetime of that popup, matching the
+// behavior of a normal Windows tray tooltip instead of following the pointer.
+static ULONGLONG g_lastHoverTelemetryTick = 0;
+static int g_hoverLastX = INT_MIN;
+static int g_hoverLastY = INT_MIN;
+static int g_hoverLastWidth = 0;
+static int g_hoverLastHeight = 0;
 
 static HANDLE g_singletonMutex = nullptr;
 
-static std::vector<unsigned int> g_topMemoryClocks;
+static std::vector<PStateChoice> g_pstateChoices;
 
 // GUID_SESSION_DISPLAY_STATUS: {2B84C20E-AD23-4DDF-93DB-05FFBD7EFCA5}.
 // Keep a private definition so the project does not depend on a GUID library
@@ -490,9 +726,9 @@ static const GUID GUID_NMW_SESSION_DISPLAY_STATUS =
 { 0x2b84c20e, 0xad23, 0x4ddf, { 0x93, 0xdb, 0x05, 0xff, 0xbd, 0x7e, 0xfc, 0xa5 } };
 
 // Recovery is deliberately state-driven. Windows power/display/session events
-// never decide whether recovery is needed; only actual memory-clock telemetry
-// that does not match the selected target can escalate from a normal NVML re-lock to an NPCF
-// (NVIDIA Platform Controllers and Framework) restart. The RTX display adapter
+// never decide whether recovery is needed; only an actual P-State mismatch can
+// escalate from a normal NVML reapply to an NPCF (NVIDIA Platform Controllers
+// and Framework) restart. The RTX display adapter
 // itself is never restarted or removed by this build.
 static bool g_watchdogTargetMismatchReported = false;
 static bool g_watchdogSetFailureReported = false;
@@ -503,10 +739,9 @@ static ULONGLONG g_nextStateUnlockAllowedTick = 0;
 static bool g_stateUnlockWorkerRunning = false;
 static bool g_stateUnlockVerifying = false;
 static ULONGLONG g_stateUnlockVerifyDeadline = 0;
-static unsigned int g_stateUnlockLastObservedMHz = 0;
+static int g_stateUnlockLastObservedPState = -1;
 
 static constexpr unsigned int NORMAL_LOCK_RETRIES_BEFORE_UNLOCK = 3;
-static constexpr unsigned int TARGET_TOLERANCE_MHZ = 1;
 static constexpr ULONGLONG POST_STATE_UNLOCK_GRACE_MS = 5000;
 static constexpr DWORD STATE_UNLOCK_VERIFY_TIMEOUT_MS = 3000;
 static constexpr UINT STATE_UNLOCK_VERIFY_INTERVAL_MS = 100;
@@ -544,8 +779,8 @@ enum ControlId
     ID_TRAY_TELEMETRY,
     ID_STARTUP,
     ID_START_MINIMIZED,
-    ID_SET_MEMCLOCK,
-    ID_RESET_MEMCLOCK,
+    ID_SET_PSTATE,
+    ID_RESET_PSTATE,
     ID_SAVE,
 
     ID_TRAY_OPEN = 2001,
@@ -622,8 +857,11 @@ static void AppendLog(const std::wstring& text)
     SYSTEMTIME st = {};
     GetLocalTime(&st);
 
-    wchar_t prefix[32] = {};
-    swprintf_s(prefix, L"[%02u:%02u:%02u] ", st.wHour, st.wMinute, st.wSecond);
+    wchar_t prefix[64] = {};
+    swprintf_s(
+        prefix,
+        L"[%04u-%02u-%02u %02u:%02u:%02u] ",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
 
     std::wstring line = prefix + text + L"\r\n";
 
@@ -640,7 +878,7 @@ static void AppendLog(const std::wstring& text)
 }
 
 // =============================================================================
-// Windows startup task
+// Windows startup registration
 // =============================================================================
 
 static std::wstring SystemExecutablePath(const wchar_t* exeName)
@@ -1019,75 +1257,84 @@ static bool RestartNpcfWithPnpUtil(
     return true;
 }
 
-static bool UpdateStartupTask(bool enabled)
+static void RemoveLegacyScheduledTasksSilently()
 {
-    const std::wstring taskName = L"NVIDIA VRAM Watchdog";
     const std::wstring schtasks = SystemExecutablePath(L"schtasks.exe");
     if (schtasks.empty())
-        return false;
+        return;
 
-    DWORD exitCode = ERROR_GEN_FAILURE;
-    bool timedOut = false;
-
-    if (!enabled)
+    const wchar_t* taskNames[] =
     {
-        const std::wstring deleteArguments =
-            L"/Delete /F /TN \"" + taskName + L"\"";
+        L"NVIDIA VRAM Watchdog",
+        L"NVIDIA Memory Watchdog",
+        L"NVIDIA PowerState Watchdog"
+    };
 
-        if (!RunHiddenProcess(
-                schtasks,
-                deleteArguments,
-                SCHTASKS_PROCESS_TIMEOUT_MS,
-                exitCode,
-                timedOut))
+    for (const wchar_t* taskName : taskNames)
+    {
+        DWORD queryCode = ERROR_GEN_FAILURE;
+        bool timedOut = false;
+        const std::wstring queryArgs = L"/Query /TN \"" + std::wstring(taskName) + L"\"";
+
+        if (!RunHiddenProcess(schtasks, queryArgs, SCHTASKS_PROCESS_TIMEOUT_MS, queryCode, timedOut) ||
+            queryCode != 0)
         {
-            return false;
+            continue;
         }
 
-        if (exitCode == 0)
-            return true;
-
-        // schtasks returns a generic non-zero code when the task is already
-        // absent. Verify absence instead of treating every delete failure as
-        // success and potentially leaving an unwanted startup task behind.
-        DWORD queryExitCode = ERROR_GEN_FAILURE;
-        bool queryTimedOut = false;
-        const std::wstring queryArguments =
-            L"/Query /TN \"" + taskName + L"\"";
-
-        if (!RunHiddenProcess(
-                schtasks,
-                queryArguments,
-                SCHTASKS_PROCESS_TIMEOUT_MS,
-                queryExitCode,
-                queryTimedOut))
-        {
-            return false;
-        }
-
-        return queryExitCode != 0; // non-zero query => task is absent
+        DWORD deleteCode = ERROR_GEN_FAILURE;
+        timedOut = false;
+        const std::wstring deleteArgs = L"/Delete /F /TN \"" + std::wstring(taskName) + L"\"";
+        RunHiddenProcess(schtasks, deleteArgs, SCHTASKS_PROCESS_TIMEOUT_MS, deleteCode, timedOut);
     }
+}
 
-    const std::wstring exe = ExePath();
+static bool UpdateStartupRegistration(bool enabled)
+{
+    HKEY key = nullptr;
+    const wchar_t* runKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 
-    // Task launches this exact executable at user logon. --startup tells the
-    // app to honor the StartMinimized setting.
-    const std::wstring arguments =
-        L"/Create /F /SC ONLOGON /RL HIGHEST "
-        L"/TN \"" + taskName + L"\" "
-        L"/TR \"\\\"" + exe + L"\\\" --startup\"";
-
-    if (!RunHiddenProcess(
-            schtasks,
-            arguments,
-            SCHTASKS_PROCESS_TIMEOUT_MS,
-            exitCode,
-            timedOut))
+    if (RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            runKey,
+            0,
+            nullptr,
+            0,
+            KEY_SET_VALUE,
+            nullptr,
+            &key,
+            nullptr) != ERROR_SUCCESS)
     {
         return false;
     }
 
-    return exitCode == 0;
+    const wchar_t* valueName = L"NVIDIA PowerState Watchdog";
+    bool ok = true;
+
+    if (enabled)
+    {
+        const std::wstring command = L"\"" + ExePath() + L"\" --startup";
+        const DWORD bytes = static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t));
+        ok = RegSetValueExW(
+                 key,
+                 valueName,
+                 0,
+                 REG_SZ,
+                 reinterpret_cast<const BYTE*>(command.c_str()),
+                 bytes) == ERROR_SUCCESS;
+    }
+    else
+    {
+        const LSTATUS r = RegDeleteValueW(key, valueName);
+        ok = (r == ERROR_SUCCESS || r == ERROR_FILE_NOT_FOUND);
+    }
+
+    // Remove only legacy Run-value names silently if they happen to exist.
+    RegDeleteValueW(key, L"NVIDIA VRAM Watchdog");
+    RegDeleteValueW(key, L"NVIDIA Memory Watchdog");
+
+    RegCloseKey(key);
+    return ok;
 }
 
 // =============================================================================
@@ -1141,6 +1388,16 @@ static bool EnsureNvml()
     return ConnectNvml(false);
 }
 
+static const PStateChoice* FindPStateChoice(int pstate)
+{
+    for (const auto& choice : g_pstateChoices)
+    {
+        if (choice.pstate == pstate)
+            return &choice;
+    }
+    return nullptr;
+}
+
 static void PopulateTargetComboFromCurrentList()
 {
     if (!g_comboTarget)
@@ -1148,44 +1405,135 @@ static void PopulateTargetComboFromCurrentList()
 
     SendMessageW(g_comboTarget, CB_RESETCONTENT, 0, 0);
 
-    if (g_topMemoryClocks.empty())
+    if (g_pstateChoices.empty())
     {
-        const std::wstring fallback = std::to_wstring(g_settings.targetMHz) + L" MHz";
+        const std::wstring fallback = L"P" + std::to_wstring(g_settings.targetPState >= 0 ? g_settings.targetPState : 0);
         SendMessageW(g_comboTarget, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(fallback.c_str()));
         SendMessageW(g_comboTarget, CB_SETCURSEL, 0, 0);
         return;
     }
 
-    for (size_t i = 0; i < g_topMemoryClocks.size(); ++i)
+    size_t selected = 0;
+    bool foundTarget = false;
+
+    for (size_t i = 0; i < g_pstateChoices.size(); ++i)
     {
-        std::wstring label = std::to_wstring(g_topMemoryClocks[i]) + L" MHz";
-        if (i == 0)
-            label += L" (Highest)";
-        else if (i == 1)
-            label += L" (2nd)";
-        else if (i == 2)
-            label += L" (3rd)";
+        const auto& choice = g_pstateChoices[i];
+        std::wstring label = L"P" + std::to_wstring(choice.pstate);
+        if (!choice.controllable)
+            label += L" (read-only)";
 
         SendMessageW(g_comboTarget, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
+
+        if (choice.pstate == g_settings.targetPState)
+        {
+            selected = i;
+            foundTarget = true;
+        }
     }
 
-    // The app always scans the COMPLETE supported memory-clock list, sorts it,
-    // and exposes the top three. Rank 0 is the automatic default. A user's
-    // explicit #2/#3 choice persists as a rank across driver sessions and app restarts.
-    const size_t selected = std::min<size_t>(
-        g_settings.targetRank,
-        g_topMemoryClocks.size() - 1);
+    // Migrate an old memory-clock target to the P-State whose lock range
+    // contains it. This happens only on the first run after upgrading.
+    if (!foundTarget && g_settings.legacyTargetMHz != 0)
+    {
+        for (size_t i = 0; i < g_pstateChoices.size(); ++i)
+        {
+            const auto& choice = g_pstateChoices[i];
+            if (choice.controllable &&
+                g_settings.legacyTargetMHz >= choice.lockMinMHz &&
+                g_settings.legacyTargetMHz <= choice.lockMaxMHz)
+            {
+                selected = i;
+                foundTarget = true;
+                break;
+            }
+        }
+    }
 
-    g_settings.targetRank = static_cast<unsigned int>(selected);
-    g_settings.targetMHz = g_topMemoryClocks[selected];
+    if (!foundTarget)
+    {
+        for (size_t i = 0; i < g_pstateChoices.size(); ++i)
+        {
+            if (g_pstateChoices[i].controllable)
+            {
+                selected = i;
+                break;
+            }
+        }
+    }
 
+    g_settings.targetPState = g_pstateChoices[selected].pstate;
+    g_settings.legacyTargetMHz = 0;
     SendMessageW(g_comboTarget, CB_SETCURSEL, static_cast<WPARAM>(selected), 0);
     SaveSettings();
 }
 
-static bool RefreshMemoryClockChoices(bool log)
+static void FilterDeepLowPowerPStates(std::vector<PStateChoice>& choices)
 {
-    g_topMemoryClocks.clear();
+    // Some GPUs expose deep idle/display-power P-States alongside normal
+    // performance P-States. They may have valid NVML memory clock entries but
+    // cannot be held while the GPU is actively driving displays or rendering.
+    // Detect a clearly separated low-clock cluster instead of hard-coding P5,
+    // P8, or any model-specific P-State numbers.
+    std::vector<unsigned int> clocks;
+    for (const auto& choice : choices)
+    {
+        if (choice.controllable && choice.lockMaxMHz > 0)
+            clocks.push_back(choice.lockMaxMHz);
+    }
+
+    std::sort(clocks.begin(), clocks.end(), std::greater<unsigned int>());
+    clocks.erase(std::unique(clocks.begin(), clocks.end()), clocks.end());
+
+    if (clocks.size() < 2)
+        return;
+
+    size_t splitIndex = clocks.size();
+    double largestRatio = 1.0;
+
+    for (size_t i = 1; i < clocks.size(); ++i)
+    {
+        if (clocks[i] == 0)
+            continue;
+
+        const double ratio = static_cast<double>(clocks[i - 1]) /
+                             static_cast<double>(clocks[i]);
+        if (ratio > largestRatio)
+        {
+            largestRatio = ratio;
+            splitIndex = i;
+        }
+    }
+
+    // Only classify a lower cluster as deep-low-power when there is a very
+    // large discontinuity and the lower cluster is at most one quarter of the
+    // highest performance memory clock. On the RTX 5090 Laptop this cleanly
+    // separates 14001/11001/9001 from 810/405 without knowing the GPU model.
+    if (splitIndex >= clocks.size() ||
+        largestRatio < 4.0 ||
+        static_cast<unsigned long long>(clocks[splitIndex]) * 4ull > clocks.front())
+    {
+        return;
+    }
+
+    const unsigned int firstDeepLowPowerClock = clocks[splitIndex];
+
+    choices.erase(
+        std::remove_if(
+            choices.begin(),
+            choices.end(),
+            [&](const PStateChoice& choice)
+            {
+                return choice.controllable &&
+                       choice.lockMaxMHz > 0 &&
+                       choice.lockMaxMHz <= firstDeepLowPowerClock;
+            }),
+        choices.end());
+}
+
+static bool RefreshPStateChoices(bool log)
+{
+    g_pstateChoices.clear();
 
     if (!EnsureNvml())
     {
@@ -1193,108 +1541,224 @@ static bool RefreshMemoryClockChoices(bool log)
         return false;
     }
 
-    std::vector<unsigned int> clocks;
+    std::vector<int> pstates;
+    std::vector<unsigned int> supportedMemClocks;
     std::string error;
 
-    if (!g_nvml.GetSupportedMemoryClocks(clocks, error) || clocks.empty())
+    if (!g_nvml.GetSupportedPStates(pstates, error) || pstates.empty())
     {
-        if (log)
-            AppendLog(L"Supported memory-clock scan failed: " + Utf8ToWide(error));
+        // Some driver branches expose the per-P-State range API without the
+        // supported-state list API. Probe P0..P15 read-only as a fallback.
+        pstates.clear();
+        for (int pstate = 0; pstate <= 15; ++pstate)
+        {
+            unsigned int minMHz = 0;
+            unsigned int maxMHz = 0;
+            std::string probeError;
+            if (g_nvml.GetPStateMemoryRange(pstate, minMHz, maxMHz, probeError))
+                pstates.push_back(pstate);
+        }
 
-        PopulateTargetComboFromCurrentList();
-        return false;
+        if (pstates.empty())
+        {
+            if (log)
+                AppendLog(L"P-State discovery failed: " + Utf8ToWide(error));
+            PopulateTargetComboFromCurrentList();
+            return false;
+        }
     }
 
-    const size_t count = std::min<size_t>(3, clocks.size());
-    g_topMemoryClocks.assign(clocks.begin(), clocks.begin() + count);
+    std::sort(pstates.begin(), pstates.end());
+    pstates.erase(std::unique(pstates.begin(), pstates.end()), pstates.end());
+
+    std::string clocksError;
+    g_nvml.GetSupportedMemoryClocks(supportedMemClocks, clocksError);
+    std::sort(supportedMemClocks.begin(), supportedMemClocks.end());
+
+    for (int pstate : pstates)
+    {
+        PStateChoice choice;
+        choice.pstate = pstate;
+
+        std::string rangeError;
+        if (!g_nvml.GetPStateMemoryRange(
+                pstate,
+                choice.reportedMemMinMHz,
+                choice.reportedMemMaxMHz,
+                rangeError))
+        {
+            g_pstateChoices.push_back(choice);
+            continue;
+        }
+
+        std::string offsetError;
+        g_nvml.GetMemoryOffset(
+            pstate,
+            choice.memOffsetMHz,
+            choice.memOffsetAvailable,
+            offsetError);
+
+        auto clocksInside = [&](long long rangeMin, long long rangeMax)
+        {
+            std::vector<unsigned int> inside;
+            if (rangeMin < 0) rangeMin = 0;
+            if (rangeMax < 0) rangeMax = 0;
+            if (rangeMin > rangeMax) std::swap(rangeMin, rangeMax);
+
+            for (unsigned int clock : supportedMemClocks)
+            {
+                if (clock >= static_cast<unsigned int>(rangeMin) &&
+                    clock <= static_cast<unsigned int>(rangeMax))
+                {
+                    inside.push_back(clock);
+                }
+            }
+            return inside;
+        };
+
+        // Different driver generations have reported P-State clock ranges with
+        // and without the active VF offset folded into them. First match the
+        // raw range. Only if that fails, normalize by the reported OC offset.
+        long long baseMin = static_cast<long long>(choice.reportedMemMinMHz);
+        long long baseMax = static_cast<long long>(choice.reportedMemMaxMHz);
+        std::vector<unsigned int> inside = clocksInside(baseMin, baseMax);
+
+        if (inside.empty() && choice.memOffsetAvailable && choice.memOffsetMHz != 0)
+        {
+            baseMin = static_cast<long long>(choice.reportedMemMinMHz) - choice.memOffsetMHz;
+            baseMax = static_cast<long long>(choice.reportedMemMaxMHz) - choice.memOffsetMHz;
+            inside = clocksInside(baseMin, baseMax);
+        }
+
+        if (!inside.empty())
+        {
+            choice.lockMinMHz = inside.front();
+            choice.lockMaxMHz = inside.back();
+            choice.controllable = true;
+        }
+        else if (baseMin > 0 && baseMax > 0)
+        {
+            // Some drivers expose a valid P-State range without repeating each
+            // endpoint in GetSupportedMemoryClocks. Keep the range as a safe
+            // fallback; NVML will reject it at apply-time if it is not legal.
+            if (baseMin > baseMax) std::swap(baseMin, baseMax);
+            choice.lockMinMHz = static_cast<unsigned int>(baseMin);
+            choice.lockMaxMHz = static_cast<unsigned int>(baseMax);
+            choice.controllable = true;
+        }
+
+        g_pstateChoices.push_back(choice);
+    }
+
+    FilterDeepLowPowerPStates(g_pstateChoices);
+
+    // The target dropdown is for states the watchdog can actually request.
+    // Read-only states remain observable through live telemetry but are not
+    // useful target choices.
+    g_pstateChoices.erase(
+        std::remove_if(
+            g_pstateChoices.begin(),
+            g_pstateChoices.end(),
+            [](const PStateChoice& choice) { return !choice.controllable; }),
+        g_pstateChoices.end());
 
     PopulateTargetComboFromCurrentList();
 
     if (log)
     {
-        std::wstring message = L"Top supported memory clocks:";
-        for (unsigned int mhz : g_topMemoryClocks)
-            message += L" " + std::to_wstring(mhz) + L" MHz";
+        std::wstring message = L"Supported P-States:";
+        for (const auto& choice : g_pstateChoices)
+            message += L" P" + std::to_wstring(choice.pstate);
         AppendLog(message + L".");
+
+        int currentPstate = -1;
+        std::string pstateError;
+        if (g_nvml.ReadPState(currentPstate, pstateError))
+        {
+            int offset = 0;
+            bool offsetSupported = false;
+            std::string offsetError;
+            if (g_nvml.GetMemoryOffset(currentPstate, offset, offsetSupported, offsetError) &&
+                offsetSupported && offset != 0)
+            {
+                if (offset > 0)
+                    AppendLog(L"Memory overclock detected: +" + std::to_wstring(offset) + L" MHz.");
+                else
+                    AppendLog(L"Memory underclock detected: " + std::to_wstring(offset) + L" MHz.");
+            }
+        }
     }
 
-    return true;
+    return !g_pstateChoices.empty();
 }
 
-static unsigned int SelectedTargetFromUi()
+static int SelectedPStateFromUi()
 {
-    if (!g_comboTarget || g_topMemoryClocks.empty())
-        return g_settings.targetMHz;
+    if (!g_comboTarget || g_pstateChoices.empty())
+        return g_settings.targetPState;
 
     const LRESULT selection = SendMessageW(g_comboTarget, CB_GETCURSEL, 0, 0);
     if (selection == CB_ERR)
-        return g_settings.targetMHz;
+        return g_settings.targetPState;
 
     const size_t index = static_cast<size_t>(selection);
-    if (index >= g_topMemoryClocks.size())
-        return g_settings.targetMHz;
+    if (index >= g_pstateChoices.size())
+        return g_settings.targetPState;
 
-    g_settings.targetRank = static_cast<unsigned int>(index);
-    return g_topMemoryClocks[index];
+    return g_pstateChoices[index].pstate;
 }
 
-static bool SetMemClockNow(const wchar_t* source, bool logSuccess = true, bool logFailure = true)
+static bool SetPStateNow(const wchar_t* source, bool logSuccess = true, bool logFailure = true)
 {
     if (!EnsureNvml())
     {
         if (logFailure)
-            AppendLog(std::wstring(source) + L": NVML unavailable.");
+            AppendLog(L"Set P-State failed: NVML unavailable.");
+        return false;
+    }
+
+    const PStateChoice* choice = FindPStateChoice(g_settings.targetPState);
+    if (!choice || !choice->controllable)
+    {
+        if (logFailure)
+            AppendLog(L"Unable to control P" + std::to_wstring(g_settings.targetPState) + L" on this GPU.");
         return false;
     }
 
     std::string error;
-
-    if (!g_nvml.SetMemory(g_settings.targetMHz, error))
+    if (!g_nvml.SetMemoryRange(choice->lockMinMHz, choice->lockMaxMHz, error))
     {
         if (logFailure)
-            AppendLog(std::wstring(source) + L": " + Utf8ToWide(error));
+            AppendLog(L"Set P-State failed: " + Utf8ToWide(error));
         return false;
     }
 
     if (logSuccess)
     {
-        AppendLog(
-            std::wstring(source) +
-            L": requested " +
-            std::to_wstring(g_settings.targetMHz) +
-            L" MHz.");
+        const std::wstring prefix = (source && wcscmp(source, L"Startup") == 0) ? L"Startup: " : L"";
+        AppendLog(prefix + L"P-State set to P" + std::to_wstring(g_settings.targetPState) + L".");
     }
 
     return true;
 }
 
-static bool ResetMemClockNow(const wchar_t* source)
+static bool ResetPStateNow()
 {
     if (!EnsureNvml())
     {
-        AppendLog(std::wstring(source) + L": NVML unavailable.");
+        AppendLog(L"Reset P-State failed: NVML unavailable.");
         return false;
     }
 
     std::string error;
-
     if (!g_nvml.ResetMemory(error))
     {
-        AppendLog(std::wstring(source) + L": " + Utf8ToWide(error));
+        AppendLog(L"Reset P-State failed: " + Utf8ToWide(error));
         return false;
     }
 
-    AppendLog(std::wstring(source) + L": memory clock lock reset.");
+    AppendLog(L"P-State lock cleared.");
     return true;
-}
-
-static bool TargetMatches(unsigned int actualMHz, unsigned int targetMHz)
-{
-    const unsigned int diff =
-        actualMHz > targetMHz
-            ? actualMHz - targetMHz
-            : targetMHz - actualMHz;
-    return diff <= TARGET_TOLERANCE_MHZ;
 }
 
 static bool CurrentTargetReached()
@@ -1302,13 +1766,12 @@ static bool CurrentTargetReached()
     if (!EnsureNvml())
         return false;
 
-    unsigned int memMHz = 0;
+    int pstate = -1;
     std::string error;
-
-    if (!g_nvml.ReadMemory(memMHz, error))
+    if (!g_nvml.ReadPState(pstate, error))
         return false;
 
-    return TargetMatches(memMHz, g_settings.targetMHz);
+    return pstate == g_settings.targetPState;
 }
 
 static void ResetWatchdogFailureEpisode();
@@ -1354,9 +1817,7 @@ static void ReportStateUnlockLimitIfNeeded()
         return;
     }
 
-    AppendLog(
-        L"Watchdog recovery: state unlocked has reached maximum attempt limit. "
-        L"Continuing normal memory-lock retries; the GPU will not be restarted.");
+    AppendLog(L"Recovery limit reached.");
     g_stateUnlockLimitReported = true;
 }
 
@@ -1371,24 +1832,17 @@ static bool StartStateUnlock()
         return false;
     }
 
-    // Proven sequence: make sure the requested target is accepted first, then
-    // restart NPCF so the platform stack re-evaluates that existing request.
-    if (!SetMemClockNow(L"State Unlock", false))
-    {
-        AppendLog(
-            L"State Unlock Failed: memory-clock request could not be completed.");
+    // Keep the proven sequence: pre-arm the target request before restarting
+    // NPCF so the platform stack can re-evaluate the already-accepted request.
+    if (!SetPStateNow(L"Recovery", false, true))
         return false;
-    }
 
-    // If the final request became effective by itself, no controller restart is
-    // necessary. The next normal watchdog sample will clear the failure episode.
     if (CurrentTargetReached())
         return false;
 
     const unsigned int attempt = g_stateUnlockAttemptCount + 1;
-
     AppendLog(
-        L"Watchdog recovery: memory-clocks could not be locked. Attempting unlock... (attempt " +
+        L"Restarting NVIDIA Platform Controllers and Framework... (attempt " +
         std::to_wstring(attempt) + L"/" +
         std::to_wstring(g_settings.unlockAttempts) + L").");
 
@@ -1402,74 +1856,44 @@ static bool StartStateUnlock()
 
     if (thread == 0)
     {
-        AppendLog(L"State Unlock failed: recovery worker could not be started.");
+        AppendLog(L"NPCF restart failed.");
         return false;
     }
 
     CloseHandle(reinterpret_cast<HANDLE>(thread));
     g_stateUnlockWorkerRunning = true;
     ++g_stateUnlockAttemptCount;
-
-    // Start the global cooldown immediately. Completion extends it again, so a
-    // fast failure cannot cause a tight restart loop.
-    g_nextStateUnlockAllowedTick =
-        GetTickCount64() + POST_STATE_UNLOCK_GRACE_MS;
-
+    g_nextStateUnlockAllowedTick = GetTickCount64() + POST_STATE_UNLOCK_GRACE_MS;
     return true;
 }
 
 static void HandleStateUnlockResult(StateUnlockWorkerResult* result)
 {
     g_stateUnlockWorkerRunning = false;
-
     if (!result)
         return;
 
-    // Every attempted restart, successful or not, gets a cooldown. This global
-    // throttle intentionally survives a later successful recovery.
-    g_nextStateUnlockAllowedTick =
-        GetTickCount64() + POST_STATE_UNLOCK_GRACE_MS;
+    g_nextStateUnlockAllowedTick = GetTickCount64() + POST_STATE_UNLOCK_GRACE_MS;
 
     if (!result->restarted)
     {
         if (result->instanceId.empty())
-        {
-            AppendLog(L"State Unlock failed: NPCF not found.");
-        }
+            AppendLog(L"NPCF not found; recovery unavailable.");
+        else if (result->exitCode == WAIT_TIMEOUT)
+            AppendLog(L"NPCF restart timed out.");
         else
-        {
-            AppendLog(
-                L"State Unlock failed: " + result->deviceName +
-                L" (" + result->instanceId + L"); pnputil exit code " +
-                std::to_wstring(result->exitCode) + L".");
-        }
+            AppendLog(L"NPCF restart failed.");
 
         ReportStateUnlockLimitIfNeeded();
         return;
     }
 
     if (g_powerPaused || !g_settings.autoRestore)
-    {
-        // The restart completed, but power/configuration changed while the
-        // worker was running. Do not begin stale verification.
         return;
-    }
-
-    AppendLog(
-        L"State Unlock Successful: " + result->deviceName +
-        L" (" + result->instanceId + L"). Verifying memory clock...");
-
-    if (!result->deviceStarted)
-    {
-        AppendLog(
-            L"State Unlock Diagnostic: pnputil reported success, but DN_STARTED had not yet appeared; "
-            L"memory-clock telemetry will decide success.");
-    }
 
     g_stateUnlockVerifying = true;
-    g_stateUnlockVerifyDeadline =
-        GetTickCount64() + STATE_UNLOCK_VERIFY_TIMEOUT_MS;
-    g_stateUnlockLastObservedMHz = 0;
+    g_stateUnlockVerifyDeadline = GetTickCount64() + STATE_UNLOCK_VERIFY_TIMEOUT_MS;
+    g_stateUnlockLastObservedPState = -1;
 
     SetTimer(
         g_main,
@@ -1496,21 +1920,17 @@ static void StateUnlockVerifyTick()
     if (EnsureNvml())
     {
         std::string error;
-        unsigned int memMHz = 0;
+        int pstate = -1;
 
-        if (g_nvml.ReadMemory(memMHz, error))
+        if (g_nvml.ReadPState(pstate, error))
         {
-            g_stateUnlockLastObservedMHz = memMHz;
+            g_stateUnlockLastObservedPState = pstate;
 
-            if (TargetMatches(memMHz, g_settings.targetMHz))
+            if (pstate == g_settings.targetPState)
             {
                 g_stateUnlockVerifying = false;
                 KillTimer(g_main, TIMER_STATE_UNLOCK_VERIFY);
-
-                AppendLog(
-                    L"State Unlock Successful: memory clock has been set to " +
-                    std::to_wstring(memMHz) + L" MHz.");
-
+                AppendLog(L"P-State restored to P" + std::to_wstring(g_settings.targetPState) + L".");
                 ResetWatchdogFailureEpisode();
                 UpdateMainTelemetry();
                 return;
@@ -1527,17 +1947,47 @@ static void StateUnlockVerifyTick()
         g_stateUnlockVerifying = false;
         KillTimer(g_main, TIMER_STATE_UNLOCK_VERIFY);
 
-        AppendLog(
-            L"State Unlock completed, but the requested memory clock was not verified within " +
-            std::to_wstring(STATE_UNLOCK_VERIFY_TIMEOUT_MS) + L" ms" +
-            (g_stateUnlockLastObservedMHz > 0
-                ? L" (last observed " +
-                    std::to_wstring(g_stateUnlockLastObservedMHz) + L" MHz)."
-                : L"."));
+        if (g_stateUnlockLastObservedPState >= 0)
+        {
+            AppendLog(
+                L"Recovery failed; P-State remains P" +
+                std::to_wstring(g_stateUnlockLastObservedPState) + L".");
+        }
+        else
+        {
+            AppendLog(L"Recovery failed.");
+        }
 
         ReportStateUnlockLimitIfNeeded();
         UpdateMainTelemetry();
     }
+}
+
+static void LayoutTelemetryRows(bool showMemoryOffset)
+{
+    // Normal layout has no empty row between Memory and Power. When an OC/UV
+    // offset exists, insert only that one conditional row underneath Memory.
+    const int powerY = showMemoryOffset ? 122 : 102;
+    const int statusY = showMemoryOffset ? 146 : 130;
+
+    if (g_lblMemOcCaption)
+        SetWindowPos(g_lblMemOcCaption, nullptr, 18, 98, 90, 20, SWP_NOZORDER | SWP_NOACTIVATE);
+    if (g_lblMemOc)
+        SetWindowPos(g_lblMemOc, nullptr, 120, 98, 120, 20, SWP_NOZORDER | SWP_NOACTIVATE);
+
+    if (g_lblPowerCaption)
+        SetWindowPos(g_lblPowerCaption, nullptr, 18, powerY, 90, 20, SWP_NOZORDER | SWP_NOACTIVATE);
+    if (g_lblPower)
+        SetWindowPos(g_lblPower, nullptr, 120, powerY, 90, 20, SWP_NOZORDER | SWP_NOACTIVATE);
+    if (g_lblTempCaption)
+        SetWindowPos(g_lblTempCaption, nullptr, 250, powerY, 90, 20, SWP_NOZORDER | SWP_NOACTIVATE);
+    if (g_lblTemp)
+        SetWindowPos(g_lblTemp, nullptr, 350, powerY, 90, 20, SWP_NOZORDER | SWP_NOACTIVATE);
+
+    if (g_lblStatusCaption)
+        SetWindowPos(g_lblStatusCaption, nullptr, 18, statusY, 90, 20, SWP_NOZORDER | SWP_NOACTIVATE);
+    if (g_lblStatus)
+        SetWindowPos(g_lblStatus, nullptr, 120, statusY, 430, 20, SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
 static void UpdateMainTelemetry()
@@ -1559,7 +2009,6 @@ static void UpdateMainTelemetry()
 
     Telemetry t;
     std::string error;
-
     if (!g_nvml.ReadTelemetry(t, error))
     {
         SetWindowTextW(g_lblStatus, L"Telemetry query failed");
@@ -1568,6 +2017,21 @@ static void UpdateMainTelemetry()
 
     SetWindowTextW(g_lblMem, (std::to_wstring(t.memMHz) + L" MHz").c_str());
     SetWindowTextW(g_lblGpuClock, (std::to_wstring(t.gpuMHz) + L" MHz").c_str());
+
+    if (g_lblMemOcCaption && g_lblMemOc)
+    {
+        const bool showOffset = t.memOffsetAvailable && t.memOffsetMHz != 0;
+        LayoutTelemetryRows(showOffset);
+        ShowWindow(g_lblMemOcCaption, showOffset ? SW_SHOWNA : SW_HIDE);
+        ShowWindow(g_lblMemOc, showOffset ? SW_SHOWNA : SW_HIDE);
+        if (showOffset)
+        {
+            const std::wstring value =
+                (t.memOffsetMHz > 0 ? L"+" : L"") +
+                std::to_wstring(t.memOffsetMHz) + L" MHz";
+            SetWindowTextW(g_lblMemOc, value.c_str());
+        }
+    }
 
     if (t.pstate >= 0)
         SetWindowTextW(g_lblPstate, (L"P" + std::to_wstring(t.pstate)).c_str());
@@ -1591,13 +2055,13 @@ static void UpdateMainTelemetry()
         SetWindowTextW(g_lblTemp, L"--");
 
     if (g_stateUnlockWorkerRunning)
-        SetWindowTextW(g_lblStatus, L"State Unlock in progress");
+        SetWindowTextW(g_lblStatus, L"Recovering P-State");
     else if (g_stateUnlockVerifying)
-        SetWindowTextW(g_lblStatus, L"Verifying memory clock");
-    else if (TargetMatches(t.memMHz, g_settings.targetMHz))
+        SetWindowTextW(g_lblStatus, L"Verifying P-State");
+    else if (t.pstate == g_settings.targetPState)
         SetWindowTextW(g_lblStatus, L"Target reached");
     else if (g_settings.autoRestore)
-        SetWindowTextW(g_lblStatus, L"Target mismatch - watchdog active");
+        SetWindowTextW(g_lblStatus, L"Target mismatch - monitoring active");
     else
         SetWindowTextW(g_lblStatus, L"Target mismatch");
 }
@@ -1632,9 +2096,6 @@ static void WatchdogTick()
     if (g_powerPaused)
         return;
 
-    // NPCF restart itself runs on a worker thread and verification has its own
-    // 100 ms timer. Do not issue competing normal lock requests during either
-    // phase; keep the UI responsive and telemetry independent.
     if (g_stateUnlockWorkerRunning || g_stateUnlockVerifying)
     {
         UpdateMainTelemetry();
@@ -1644,33 +2105,29 @@ static void WatchdogTick()
     if (!EnsureNvml())
         return;
 
-    unsigned int memMHz = 0;
+    int currentPstate = -1;
     std::string error;
-
-    if (!g_nvml.ReadMemory(memMHz, error))
+    if (!g_nvml.ReadPState(currentPstate, error))
     {
         g_nvmlReady = false;
         return;
     }
 
-    const bool targetReached = TargetMatches(memMHz, g_settings.targetMHz);
+    const bool targetReached = currentPstate == g_settings.targetPState;
 
     if (g_settings.autoRestore && !targetReached)
     {
         if (!g_watchdogTargetMismatchReported)
         {
             AppendLog(
-                L"Watchdog: memory clock does not match target (actual " +
-                std::to_wstring(memMHz) + L" MHz, target " +
-                std::to_wstring(g_settings.targetMHz) +
-                L" MHz); attempting normal lock recovery.");
+                L"P-State does not match target (actual P" +
+                std::to_wstring(currentPstate) + L", target P" +
+                std::to_wstring(g_settings.targetPState) +
+                L"); attempting recovery.");
             g_watchdogTargetMismatchReported = true;
         }
 
-        // Only count a normal-recovery request if NVML actually accepted it.
-        // State Unlock is specifically for the accepted-but-not-enforced case.
-        // Repeated identical NVML setter failures are logged once per episode.
-        if (SetMemClockNow(L"Watchdog", false, !g_watchdogSetFailureReported))
+        if (SetPStateNow(L"Recovery", false, !g_watchdogSetFailureReported))
         {
             g_watchdogSetFailureReported = false;
             ++g_watchdogTargetMismatchRetries;
@@ -1688,31 +2145,21 @@ static void WatchdogTick()
             if (now >= g_nextStateUnlockAllowedTick)
             {
                 if (g_stateUnlockAttemptCount < g_settings.unlockAttempts)
-                {
                     StartStateUnlock();
-                }
                 else
-                {
                     ReportStateUnlockLimitIfNeeded();
-                }
             }
         }
     }
     else if (targetReached)
     {
         if (g_watchdogTargetMismatchReported)
-        {
-            AppendLog(
-                L"Watchdog: target restored at " +
-                std::to_wstring(memMHz) + L" MHz.");
-        }
+            AppendLog(L"P-State restored to P" + std::to_wstring(g_settings.targetPState) + L".");
 
         ResetWatchdogFailureEpisode();
     }
     else
     {
-        // Auto Restore is disabled. Do not retain stale failure counters that
-        // could trigger recovery when the option is enabled later.
         ResetWatchdogFailureEpisode();
     }
 
@@ -1744,7 +2191,7 @@ static void PauseWatchdogForPower(const wchar_t* reason)
         SetWindowTextW(g_lblStatus, L"Paused - display off / standby");
 
     if (!wasPaused && reason)
-        AppendLog(std::wstring(reason) + L": watchdog paused; low-power GPU clocks will be ignored.");
+        AppendLog(std::wstring(reason) + L": monitoring paused; low-power P-States will be ignored.");
 }
 
 static void ScheduleWatchdogResume(const wchar_t* reason)
@@ -1773,7 +2220,7 @@ static void ScheduleWatchdogResume(const wchar_t* reason)
         SetWindowTextW(g_lblStatus, L"Display on - waiting for NVIDIA driver");
 
     if (reason)
-        AppendLog(std::wstring(reason) + L": waiting briefly for NVIDIA driver before resuming watchdog.");
+        AppendLog(std::wstring(reason) + L": waiting briefly for NVIDIA driver.");
 }
 
 static void CompleteWatchdogResume()
@@ -1806,7 +2253,7 @@ static void CompleteWatchdogResume()
     bool requested = false;
 
     if (connected && g_settings.autoRestore)
-        requested = SetMemClockNow(L"Wake", false);
+        requested = SetPStateNow(L"Wake", false);
 
     if (g_main)
         SetTimer(g_main, TIMER_WATCHDOG, g_settings.pollMs, nullptr);
@@ -1814,13 +2261,13 @@ static void CompleteWatchdogResume()
     if (connected)
     {
         if (g_settings.autoRestore && requested)
-            AppendLog(L"Watchdog resumed after display-on; selected memory clock reapplied.");
+            AppendLog(L"Monitoring resumed; selected P-State reapplied.");
         else
-            AppendLog(L"Watchdog resumed after display-on.");
+            AppendLog(L"Monitoring resumed.");
     }
     else
     {
-        AppendLog(L"Watchdog resumed after display-on; NVML is not ready yet and will be retried normally.");
+        AppendLog(L"Monitoring resumed; NVIDIA driver is not ready yet.");
     }
 
     UpdateMainTelemetry();
@@ -1848,11 +2295,10 @@ static bool TryAddTrayIcon()
     g_nid.cbSize = sizeof(g_nid);
     g_nid.hWnd = g_main;
     g_nid.uID = 1;
-    g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_GUID;
+    g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_GUID;
     g_nid.uCallbackMessage = WM_TRAY;
     g_nid.hIcon = LoadIconW(g_instance, MAKEINTRESOURCEW(IDI_APP_ICON));
     g_nid.guidItem = g_trayIconGuid;
-    wcscpy_s(g_nid.szTip, _countof(g_nid.szTip), L"NVIDIA VRAM Watchdog");
 
     if (!Shell_NotifyIconW(NIM_ADD, &g_nid))
         return false;
@@ -1904,7 +2350,7 @@ static void ShowTrayMenu()
         menu,
         MF_STRING,
         ID_TRAY_SETRESET,
-        targetReached ? L"Reset MemClock" : L"Set MemClock");
+        targetReached ? L"Reset P-State" : L"Set P-State");
 
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, ID_TRAY_EXIT, L"Exit");
@@ -1931,6 +2377,8 @@ static void ShowTrayMenu()
 // Hover telemetry popup
 // =============================================================================
 
+static void EndHover();
+
 static bool TrayRect(RECT& rc)
 {
     if (!g_trayAdded)
@@ -1945,31 +2393,62 @@ static bool TrayRect(RECT& rc)
     return SUCCEEDED(Shell_NotifyIconGetRect(&id, &rc));
 }
 
-static bool MouseStillNearTrayIcon()
+static void UpdateHoverIconRectFromTrayCallback()
 {
+    POINT pt = {};
+    if (!GetCursorPos(&pt))
+        return;
+
+    RECT exact = {};
+    if (TrayRect(exact))
+    {
+        const LONG rawWidth = exact.right - exact.left;
+        const LONG rawHeight = exact.bottom - exact.top;
+
+        // If Explorer returned a rectangle in the same coordinate space as the
+        // cursor, use it verbatim.  If DPI virtualization makes the rectangle
+        // miss the cursor, preserve its reported size but translate it to the
+        // callback point.  Either way the rectangle is captured once and never
+        // follows subsequent mouse movement.
+        if (rawWidth > 0 && rawHeight > 0 && PtInRect(&exact, pt))
+        {
+            g_hoverIconRect = exact;
+            g_hoverIconRectValid = true;
+            return;
+        }
+
+        const LONG width = std::clamp<LONG>(rawWidth > 0 ? rawWidth : 28, 16, 48);
+        const LONG height = std::clamp<LONG>(rawHeight > 0 ? rawHeight : 28, 16, 48);
+        g_hoverIconRect.left = pt.x - width / 2;
+        g_hoverIconRect.right = g_hoverIconRect.left + width;
+        g_hoverIconRect.top = pt.y - height / 2;
+        g_hoverIconRect.bottom = g_hoverIconRect.top + height;
+        g_hoverIconRectValid = true;
+        return;
+    }
+
+    // Explorer can temporarily refuse Shell_NotifyIconGetRect (for example
+    // while rebuilding the tray).  A small fixed rectangle around the callback
+    // point is a safe fallback because WM_MOUSEMOVE came from OUR icon.
+    constexpr LONG width = 28;
+    constexpr LONG height = 28;
+    g_hoverIconRect.left = pt.x - width / 2;
+    g_hoverIconRect.right = g_hoverIconRect.left + width;
+    g_hoverIconRect.top = pt.y - height / 2;
+    g_hoverIconRect.bottom = g_hoverIconRect.top + height;
+    g_hoverIconRectValid = true;
+}
+
+static bool MouseOverTrayIcon()
+{
+    if (!g_hoverIconRectValid)
+        return false;
+
     POINT pt = {};
     if (!GetCursorPos(&pt))
         return false;
 
-    RECT rc = {};
-
-    if (TrayRect(rc))
-    {
-        InflateRect(&rc, 10, 10);
-        if (PtInRect(&rc, pt))
-            return true;
-    }
-
-    if (g_hoverAnchorValid)
-    {
-        LONG dx = pt.x - g_hoverAnchor.x;
-        LONG dy = pt.y - g_hoverAnchor.y;
-
-        if (dx >= -40 && dx <= 40 && dy >= -40 && dy <= 40)
-            return true;
-    }
-
-    return false;
+    return PtInRect(&g_hoverIconRect, pt) != FALSE;
 }
 
 static LRESULT CALLBACK HoverProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -1985,38 +2464,122 @@ static LRESULT CALLBACK HoverProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
     case WM_PAINT:
     {
         PAINTSTRUCT ps = {};
-        HDC dc = BeginPaint(hwnd, &ps);
+        HDC targetDc = BeginPaint(hwnd, &ps);
 
         RECT client = {};
         GetClientRect(hwnd, &client);
 
-        HBRUSH background = CreateSolidBrush(GetSysColor(COLOR_INFOBK));
-        FillRect(dc, &client, background);
+        const int width = std::max<LONG>(1, client.right - client.left);
+        const int height = std::max<LONG>(1, client.bottom - client.top);
+
+        // Draw the whole card into an off-screen bitmap, then present it in one
+        // BitBlt. This avoids visible GDI redraw/erase flicker while telemetry
+        // updates in place.
+        HDC dc = CreateCompatibleDC(targetDc);
+        HBITMAP bitmap = CreateCompatibleBitmap(targetDc, width, height);
+        HGDIOBJ oldBitmap = nullptr;
+        if (dc && bitmap)
+            oldBitmap = SelectObject(dc, bitmap);
+
+        HDC drawDc = (dc && bitmap) ? dc : targetDc;
+
+        const COLORREF bgColor = RGB(45, 45, 48);
+        const COLORREF headerColor = RGB(39, 39, 42);
+        const COLORREF borderColor = RGB(72, 72, 78);
+        const COLORREF dividerColor = RGB(66, 66, 71);
+        const COLORREF textColor = RGB(242, 242, 242);
+        const COLORREF labelColor = RGB(205, 205, 210);
+
+        HBRUSH background = CreateSolidBrush(bgColor);
+        FillRect(drawDc, &client, background);
         DeleteObject(background);
 
-        HBRUSH border = CreateSolidBrush(GetSysColor(COLOR_WINDOWFRAME));
-        FrameRect(dc, &client, border);
-        DeleteObject(border);
+        constexpr int headerHeight = 31;
+        RECT headerRect = client;
+        headerRect.bottom = std::min<LONG>(client.bottom, static_cast<LONG>(headerHeight));
+        HBRUSH headerBrush = CreateSolidBrush(headerColor);
+        FillRect(drawDc, &headerRect, headerBrush);
+        DeleteObject(headerBrush);
 
-        SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, GetSysColor(COLOR_INFOTEXT));
+        HPEN dividerPen = CreatePen(PS_SOLID, 1, dividerColor);
+        HGDIOBJ oldPen = SelectObject(drawDc, dividerPen);
+        MoveToEx(drawDc, 10, headerHeight, nullptr);
+        LineTo(drawDc, std::max<LONG>(10, client.right - 10), headerHeight);
+        SelectObject(drawDc, oldPen);
+        DeleteObject(dividerPen);
+
+        HPEN borderPen = CreatePen(PS_SOLID, 1, borderColor);
+        oldPen = SelectObject(drawDc, borderPen);
+        HGDIOBJ oldBrush = SelectObject(drawDc, GetStockObject(HOLLOW_BRUSH));
+        RoundRect(drawDc, 0, 0, client.right, client.bottom, 12, 12);
+        SelectObject(drawDc, oldBrush);
+        SelectObject(drawDc, oldPen);
+        DeleteObject(borderPen);
+
+        SetBkMode(drawDc, TRANSPARENT);
+        SetTextColor(drawDc, textColor);
 
         HFONT oldFont = nullptr;
-        if (g_font)
-            oldFont = static_cast<HFONT>(SelectObject(dc, g_font));
+        HFONT headerFont = g_hoverHeaderFont ? g_hoverHeaderFont : (g_hoverFont ? g_hoverFont : g_font);
+        if (headerFont)
+            oldFont = static_cast<HFONT>(SelectObject(drawDc, headerFont));
 
-        RECT textRect = client;
-        InflateRect(&textRect, -10, -8);
-
-        DrawTextW(
-            dc,
-            g_hoverText.c_str(),
-            -1,
-            &textRect,
-            DT_LEFT | DT_TOP | DT_NOPREFIX);
+        RECT titleRect = {12, 6, client.right - 12, headerHeight - 4};
+        DrawTextW(drawDc, L"NVIDIA PowerState Watchdog", -1, &titleRect,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 
         if (oldFont)
-            SelectObject(dc, oldFont);
+            SelectObject(drawDc, oldFont);
+
+        HFONT bodyFont = g_hoverFont ? g_hoverFont : g_font;
+        oldFont = nullptr;
+        if (bodyFont)
+            oldFont = static_cast<HFONT>(SelectObject(drawDc, bodyFont));
+
+        constexpr int left = 12;
+        constexpr int valueLeft = 104;
+        constexpr int rowHeight = 18;
+        int y = headerHeight + 8;
+
+        if (!g_hoverMessage.empty())
+        {
+            SetTextColor(drawDc, labelColor);
+            RECT msgRect = {left, y, client.right - 12, client.bottom - 8};
+            DrawTextW(drawDc, g_hoverMessage.c_str(), -1, &msgRect,
+                      DT_LEFT | DT_TOP | DT_NOPREFIX | DT_WORDBREAK);
+        }
+        else
+        {
+            for (const HoverRow& row : g_hoverRows)
+            {
+                SetTextColor(drawDc, labelColor);
+                RECT labelRect = {left, y, valueLeft - 6, y + rowHeight};
+                DrawTextW(drawDc, row.label.c_str(), -1, &labelRect,
+                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+                SetTextColor(drawDc, textColor);
+                RECT valueRect = {valueLeft, y, client.right - 12, y + rowHeight};
+                DrawTextW(drawDc, row.value.c_str(), -1, &valueRect,
+                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+                y += rowHeight;
+            }
+        }
+
+        if (oldFont)
+            SelectObject(drawDc, oldFont);
+
+        if (dc && bitmap)
+        {
+            BitBlt(targetDc, 0, 0, width, height, dc, 0, 0, SRCCOPY);
+            if (oldBitmap)
+                SelectObject(dc, oldBitmap);
+        }
+
+        if (bitmap)
+            DeleteObject(bitmap);
+        if (dc)
+            DeleteDC(dc);
 
         EndPaint(hwnd, &ps);
         return 0;
@@ -2032,8 +2595,8 @@ static void EnsureHoverWindow()
         return;
 
     g_hover = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-        L"NMW_Fresh_Hover",
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+        L"NPSW_Hover",
         L"",
         WS_POPUP,
         0, 0, 10, 10,
@@ -2041,79 +2604,197 @@ static void EnsureHoverWindow()
         nullptr,
         g_instance,
         nullptr);
+
+    if (!g_hover)
+        return;
+
+    if (!g_hoverFont)
+    {
+        // Compact body typography. The popup should be readable without visually
+        // dominating the notification area.
+        g_hoverFont = CreateFontW(
+            -12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    }
+
+    if (!g_hoverHeaderFont)
+    {
+        g_hoverHeaderFont = CreateFontW(
+            -12, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    }
+
+    // Windows 11-style dark rounded card when supported. The GDI rounded region
+    // below remains the fallback on older Windows builds.
+    const BOOL dark = TRUE;
+    const DWORD darkModeAttribute = 20; // DWMWA_USE_IMMERSIVE_DARK_MODE
+    DwmSetWindowAttribute(g_hover, darkModeAttribute, &dark, sizeof(dark));
+
+    const DWORD cornerAttribute = 33; // DWMWA_WINDOW_CORNER_PREFERENCE
+    const int roundedPreference = 2;  // DWMWCP_ROUND
+    DwmSetWindowAttribute(
+        g_hover,
+        cornerAttribute,
+        &roundedPreference,
+        sizeof(roundedPreference));
 }
 
 static void PositionHoverWindow()
 {
-    if (!g_hover)
+    if (!g_hover || !g_hoverIconRectValid)
         return;
 
-    RECT tray = {};
-    POINT cursor = {};
-    GetCursorPos(&cursor);
+    // Size from the structured rows rather than a raw multiline DrawText block.
+    constexpr int headerHeight = 31;
+    constexpr int rowHeight = 18;
+    constexpr int verticalPadding = 18;
+    constexpr int minWidth = 228;
 
-    if (!TrayRect(tray))
-    {
-        tray.left = cursor.x - 16;
-        tray.right = cursor.x + 16;
-        tray.top = cursor.y - 16;
-        tray.bottom = cursor.y + 16;
-    }
+    int width = minWidth;
+    int bodyHeight = 0;
 
     HDC dc = GetDC(g_hover);
+    if (dc)
+    {
+        HFONT bodyFont = g_hoverFont ? g_hoverFont : g_font;
+        HFONT oldFont = nullptr;
+        if (bodyFont)
+            oldFont = static_cast<HFONT>(SelectObject(dc, bodyFont));
 
-    HFONT oldFont = nullptr;
-    if (g_font)
-        oldFont = static_cast<HFONT>(SelectObject(dc, g_font));
+        SIZE size = {};
+        for (const HoverRow& row : g_hoverRows)
+        {
+            std::wstring line = row.label + L"    " + row.value;
+            if (GetTextExtentPoint32W(dc, line.c_str(), static_cast<int>(line.size()), &size))
+                width = std::max(width, static_cast<int>(size.cx) + 28);
+        }
 
-    RECT measured = {0, 0, 520, 0};
+        if (!g_hoverMessage.empty())
+        {
+            RECT measured = {0, 0, 260, 0};
+            DrawTextW(dc, g_hoverMessage.c_str(), -1, &measured,
+                      DT_LEFT | DT_TOP | DT_NOPREFIX | DT_WORDBREAK | DT_CALCRECT);
+            width = std::max(width, static_cast<int>(measured.right - measured.left) + 28);
+            bodyHeight = std::max(rowHeight, static_cast<int>(measured.bottom - measured.top));
+        }
+        else
+        {
+            bodyHeight = std::max(rowHeight, static_cast<int>(g_hoverRows.size()) * rowHeight);
+        }
 
-    DrawTextW(
-        dc,
-        g_hoverText.c_str(),
-        -1,
-        &measured,
-        DT_LEFT | DT_TOP | DT_NOPREFIX | DT_CALCRECT);
+        if (oldFont)
+            SelectObject(dc, oldFont);
+        ReleaseDC(g_hover, dc);
+    }
+    else
+    {
+        bodyHeight = std::max(rowHeight, static_cast<int>(g_hoverRows.size()) * rowHeight);
+    }
 
-    if (oldFont)
-        SelectObject(dc, oldFont);
+    width = std::min(width, 320);
+    const int height = headerHeight + verticalPadding + bodyHeight;
 
-    ReleaseDC(g_hover, dc);
+    // Behave like a native notification-area tooltip: anchor to the icon itself,
+    // not the cursor, and place the card immediately outside the taskbar edge.
+    // This leaves the icon completely unobstructed for left/right clicks.
+    const RECT icon = g_hoverIconRect;
+    POINT iconCenter = {
+        (icon.left + icon.right) / 2,
+        (icon.top + icon.bottom) / 2
+    };
 
-    const int measuredWidth = static_cast<int>(measured.right - measured.left);
-    const int measuredHeight = static_cast<int>(measured.bottom - measured.top);
-
-    int width = std::max(210, measuredWidth + 20);
-    int height = std::max(40, measuredHeight + 16);
-
-    HMONITOR monitor = MonitorFromRect(&tray, MONITOR_DEFAULTTONEAREST);
-
+    HMONITOR monitor = MonitorFromPoint(iconCenter, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi = {};
     mi.cbSize = sizeof(mi);
-    GetMonitorInfoW(monitor, &mi);
+    if (!GetMonitorInfoW(monitor, &mi))
+        return;
 
-    int x = ((tray.left + tray.right) / 2) - (width / 2);
-    int y = tray.top - height - 8;
+    const int monitorWidth = mi.rcMonitor.right - mi.rcMonitor.left;
+    const int monitorHeight = mi.rcMonitor.bottom - mi.rcMonitor.top;
+    const int relX = iconCenter.x - mi.rcMonitor.left;
+    const int relY = iconCenter.y - mi.rcMonitor.top;
 
-    if (y < mi.rcWork.top)
-        y = tray.bottom + 8;
+    const int distLeft = relX;
+    const int distRight = monitorWidth - relX;
+    const int distTop = relY;
+    const int distBottom = monitorHeight - relY;
 
-    const int workLeft = static_cast<int>(mi.rcWork.left);
-    const int workTop = static_cast<int>(mi.rcWork.top);
-    const int workRight = static_cast<int>(mi.rcWork.right);
-    const int workBottom = static_cast<int>(mi.rcWork.bottom);
+    enum class TaskbarEdge { Bottom, Top, Left, Right };
+    TaskbarEdge edge = TaskbarEdge::Bottom;
+    int best = distBottom;
+    if (distTop < best) { best = distTop; edge = TaskbarEdge::Top; }
+    if (distLeft < best) { best = distLeft; edge = TaskbarEdge::Left; }
+    if (distRight < best) { edge = TaskbarEdge::Right; }
 
-    x = std::max(workLeft, std::min(x, workRight - width));
-    y = std::max(workTop, std::min(y, workBottom - height));
+    constexpr int gap = 8;
+    constexpr int margin = 8;
 
-    SetWindowPos(
-        g_hover,
-        HWND_TOPMOST,
-        x, y, width, height,
-        SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    int x = iconCenter.x - width / 2;
+    int y = icon.top - height - gap;
 
-    InvalidateRect(g_hover, nullptr, TRUE);
-    UpdateWindow(g_hover);
+    switch (edge)
+    {
+    case TaskbarEdge::Bottom:
+        x = iconCenter.x - width / 2;
+        y = icon.top - height - gap;
+        break;
+    case TaskbarEdge::Top:
+        x = iconCenter.x - width / 2;
+        y = icon.bottom + gap;
+        break;
+    case TaskbarEdge::Left:
+        x = icon.right + gap;
+        y = iconCenter.y - height / 2;
+        break;
+    case TaskbarEdge::Right:
+        x = icon.left - width - gap;
+        y = iconCenter.y - height / 2;
+        break;
+    }
+
+    // Clamp only to the monitor edges.  Do not clamp the popup back toward the
+    // taskbar work area; its position relative to the icon above is authoritative.
+    const int minX = static_cast<int>(mi.rcMonitor.left) + margin;
+    const int maxX = std::max(minX, static_cast<int>(mi.rcMonitor.right) - width - margin);
+    const int minY = static_cast<int>(mi.rcMonitor.top) + margin;
+    const int maxY = std::max(minY, static_cast<int>(mi.rcMonitor.bottom) - height - margin);
+
+    x = std::max(minX, std::min(x, maxX));
+    y = std::max(minY, std::min(y, maxY));
+
+    const bool geometryChanged =
+        x != g_hoverLastX || y != g_hoverLastY ||
+        width != g_hoverLastWidth || height != g_hoverLastHeight;
+
+    if (geometryChanged)
+    {
+        HRGN rounded = CreateRoundRectRgn(0, 0, width + 1, height + 1, 12, 12);
+        if (rounded && !SetWindowRgn(g_hover, rounded, FALSE))
+            DeleteObject(rounded);
+
+        g_hoverLastX = x;
+        g_hoverLastY = y;
+        g_hoverLastWidth = width;
+        g_hoverLastHeight = height;
+
+        SetWindowPos(
+            g_hover,
+            HWND_TOPMOST,
+            x, y, width, height,
+            SWP_NOACTIVATE | (IsWindowVisible(g_hover) ? 0 : SWP_SHOWWINDOW));
+    }
+    else if (!IsWindowVisible(g_hover))
+    {
+        SetWindowPos(
+            g_hover,
+            HWND_TOPMOST,
+            x, y, width, height,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+
+    InvalidateRect(g_hover, nullptr, FALSE);
 }
 
 static void RefreshHoverTelemetry()
@@ -2121,52 +2802,54 @@ static void RefreshHoverTelemetry()
     if (!g_hoverActive)
         return;
 
+    g_hoverRows.clear();
+    g_hoverMessage.clear();
+
     if (g_powerPaused)
     {
-        g_hoverText = L"NVIDIA VRAM Watchdog\nPaused - display off / standby";
-        PositionHoverWindow();
-        return;
+        g_hoverMessage = L"Paused - display off / standby";
     }
-
-    std::wostringstream ss;
-    ss.setf(std::ios::fixed);
-    ss.precision(1);
-
-    ss << L"NVIDIA VRAM Watchdog";
-
-    if (g_settings.showTrayTelemetry && EnsureNvml())
+    else if (g_settings.showTrayTelemetry && EnsureNvml())
     {
         Telemetry t;
         std::string error;
-
         if (g_nvml.ReadTelemetry(t, error))
         {
-            ss << L"\n";
-            ss << L"Mem " << t.memMHz << L" MHz | GPU " << t.gpuMHz << L" MHz";
-            ss << L"\n";
+            HoverRow pstate;
+            pstate.label = L"P-State";
+            pstate.value = (t.pstate >= 0) ? (L"P" + std::to_wstring(t.pstate)) : L"--";
+            g_hoverRows.push_back(pstate);
 
-            if (t.pstate >= 0)
-                ss << L"P" << t.pstate;
-            else
-                ss << L"P?";
+            g_hoverRows.push_back({L"Memory", std::to_wstring(t.memMHz) + L" MHz"});
 
-            ss << L" | ";
+            if (t.memOffsetAvailable && t.memOffsetMHz != 0)
+            {
+                std::wstring oc;
+                if (t.memOffsetMHz > 0)
+                    oc += L"+";
+                oc += std::to_wstring(t.memOffsetMHz) + L" MHz";
+                g_hoverRows.push_back({L"Memory OC", oc});
+            }
 
+            g_hoverRows.push_back({L"GPU Clock", std::to_wstring(t.gpuMHz) + L" MHz"});
+
+            std::wostringstream power;
+            power.setf(std::ios::fixed);
+            power.precision(1);
             if (t.watts >= 0.0)
-                ss << t.watts << L" W";
+                power << t.watts << L" W";
             else
-                ss << L"-- W";
+                power << L"--";
+            g_hoverRows.push_back({L"Power", power.str()});
 
-            ss << L" | ";
-
-            if (t.tempC >= 0)
-                ss << t.tempC << L" C";
-            else
-                ss << L"-- C";
+            std::wstring temp = (t.tempC >= 0) ? (std::to_wstring(t.tempC) + L" C") : L"--";
+            g_hoverRows.push_back({L"Temperature", temp});
+        }
+        else
+        {
+            g_hoverMessage = L"Telemetry unavailable";
         }
     }
-
-    g_hoverText = ss.str();
 
     EnsureHoverWindow();
     PositionHoverWindow();
@@ -2174,25 +2857,26 @@ static void RefreshHoverTelemetry()
 
 static void BeginHover()
 {
-    POINT pt = {};
-    if (GetCursorPos(&pt))
-    {
-        g_hoverAnchor = pt;
-        g_hoverAnchorValid = true;
-    }
+    if (g_hoverActive)
+        return;
 
-    if (!g_hoverActive)
-    {
-        g_hoverActive = true;
-        RefreshHoverTelemetry();
-        SetTimer(g_main, TIMER_HOVER, 250, nullptr);
-    }
+    UpdateHoverIconRectFromTrayCallback();
+    if (!g_hoverIconRectValid)
+        return;
+
+    g_hoverActive = true;
+    g_lastHoverTelemetryTick = GetTickCount64();
+    RefreshHoverTelemetry();
+    // Keep hover-exit detection responsive, but telemetry itself refreshes at
+    // 4 Hz.  The captured icon rectangle stays fixed until the popup closes.
+    SetTimer(g_main, TIMER_HOVER, 100, nullptr);
 }
 
 static void EndHover()
 {
     g_hoverActive = false;
-    g_hoverAnchorValid = false;
+    g_hoverIconRectValid = false;
+    g_lastHoverTelemetryTick = 0;
     KillTimer(g_main, TIMER_HOVER);
 
     if (g_hover)
@@ -2204,13 +2888,18 @@ static void HoverTick()
     if (!g_hoverActive)
         return;
 
-    if (!MouseStillNearTrayIcon())
+    if (!MouseOverTrayIcon())
     {
         EndHover();
         return;
     }
 
-    RefreshHoverTelemetry();
+    const ULONGLONG now = GetTickCount64();
+    if (now - g_lastHoverTelemetryTick >= 250)
+    {
+        g_lastHoverTelemetryTick = now;
+        RefreshHoverTelemetry();
+    }
 }
 
 // =============================================================================
@@ -2272,7 +2961,7 @@ static void SyncAutoRestoreFromUi(bool persist)
 static void PullSettingsFromUi()
 {
     g_settings.gpuIndex = EditUInt(g_editGpuIndex, g_settings.gpuIndex);
-    g_settings.targetMHz = SelectedTargetFromUi();
+    g_settings.targetPState = SelectedPStateFromUi();
     g_settings.pollMs = EditUInt(g_editPoll, g_settings.pollMs);
     g_settings.pollMs = std::clamp(g_settings.pollMs, 100u, 10000u);
 
@@ -2295,108 +2984,113 @@ static void BuildUi()
     MakeControl(L"STATIC", L"GPU:", SS_LEFT, 18, 18, 90, 20);
     g_lblGpu = MakeControl(L"STATIC", L"--", SS_LEFT, 120, 18, 430, 20);
 
-    MakeControl(L"STATIC", L"Memory:", SS_LEFT, 18, 46, 90, 20);
-    g_lblMem = MakeControl(L"STATIC", L"--", SS_LEFT, 120, 46, 110, 20);
+    g_lblPstateCaption = MakeControl(L"STATIC", L"P-State:", SS_LEFT, 18, 46, 90, 20);
+    g_lblPstate = MakeControl(L"STATIC", L"--", SS_LEFT, 120, 46, 90, 20);
 
-    MakeControl(L"STATIC", L"GPU clock:", SS_LEFT, 250, 46, 90, 20);
-    g_lblGpuClock = MakeControl(L"STATIC", L"--", SS_LEFT, 350, 46, 120, 20);
+    g_lblMemCaption = MakeControl(L"STATIC", L"Memory:", SS_LEFT, 18, 74, 90, 20);
+    g_lblMem = MakeControl(L"STATIC", L"--", SS_LEFT, 120, 74, 120, 20);
 
-    MakeControl(L"STATIC", L"P-state:", SS_LEFT, 18, 74, 90, 20);
-    g_lblPstate = MakeControl(L"STATIC", L"--", SS_LEFT, 120, 74, 70, 20);
+    g_lblGpuClockCaption = MakeControl(L"STATIC", L"GPU clock:", SS_LEFT, 250, 74, 90, 20);
+    g_lblGpuClock = MakeControl(L"STATIC", L"--", SS_LEFT, 350, 74, 120, 20);
 
-    MakeControl(L"STATIC", L"Power:", SS_LEFT, 210, 74, 60, 20);
-    g_lblPower = MakeControl(L"STATIC", L"--", SS_LEFT, 275, 74, 85, 20);
+    g_lblMemOcCaption = MakeControl(L"STATIC", L"Memory OC:", SS_LEFT, 18, 98, 90, 20);
+    g_lblMemOc = MakeControl(L"STATIC", L"--", SS_LEFT, 120, 98, 120, 20);
+    ShowWindow(g_lblMemOcCaption, SW_HIDE);
+    ShowWindow(g_lblMemOc, SW_HIDE);
 
-    MakeControl(L"STATIC", L"Temp:", SS_LEFT, 380, 74, 55, 20);
-    g_lblTemp = MakeControl(L"STATIC", L"--", SS_LEFT, 440, 74, 85, 20);
+    g_lblPowerCaption = MakeControl(L"STATIC", L"Power:", SS_LEFT, 18, 102, 90, 20);
+    g_lblPower = MakeControl(L"STATIC", L"--", SS_LEFT, 120, 102, 90, 20);
 
-    MakeControl(L"STATIC", L"Status:", SS_LEFT, 18, 102, 90, 20);
-    g_lblStatus = MakeControl(L"STATIC", L"Starting...", SS_LEFT, 120, 102, 430, 20);
+    g_lblTempCaption = MakeControl(L"STATIC", L"Temp:", SS_LEFT, 250, 102, 90, 20);
+    g_lblTemp = MakeControl(L"STATIC", L"--", SS_LEFT, 350, 102, 90, 20);
 
-    MakeControl(L"STATIC", L"GPU index", SS_LEFT, 18, 144, 100, 20);
+    g_lblStatusCaption = MakeControl(L"STATIC", L"Status:", SS_LEFT, 18, 130, 90, 20);
+    g_lblStatus = MakeControl(L"STATIC", L"Starting...", SS_LEFT, 120, 130, 430, 20);
+
+    MakeControl(L"STATIC", L"GPU index", SS_LEFT, 18, 172, 100, 20);
     g_editGpuIndex = MakeControl(
         L"EDIT", L"0",
         WS_BORDER | ES_NUMBER | ES_AUTOHSCROLL,
-        125, 140, 90, 24,
+        125, 168, 90, 24,
         ID_GPU_INDEX,
         WS_EX_CLIENTEDGE);
 
-    MakeControl(L"STATIC", L"Target memory clock", SS_LEFT, 235, 144, 135, 20);
+    MakeControl(L"STATIC", L"Target P-State", SS_LEFT, 235, 172, 135, 20);
     g_comboTarget = MakeControl(
         L"COMBOBOX", L"",
         CBS_DROPDOWNLIST | WS_VSCROLL,
-        375, 138, 165, 120,
+        375, 166, 165, 180,
         ID_TARGET,
         WS_EX_CLIENTEDGE);
 
-    MakeControl(L"STATIC", L"Poll interval ms", SS_LEFT, 18, 178, 100, 20);
+    MakeControl(L"STATIC", L"Poll interval ms", SS_LEFT, 18, 206, 100, 20);
     g_editPoll = MakeControl(
         L"EDIT", L"500",
         WS_BORDER | ES_NUMBER | ES_AUTOHSCROLL,
-        125, 174, 90, 24,
+        125, 202, 90, 24,
         ID_POLL,
         WS_EX_CLIENTEDGE);
 
-    MakeControl(L"STATIC", L"Unlock attempts", SS_LEFT, 235, 178, 105, 20);
+    MakeControl(L"STATIC", L"Recovery attempts", SS_LEFT, 235, 206, 105, 20);
     g_editUnlockAttempts = MakeControl(
         L"EDIT", L"3",
         WS_BORDER | ES_NUMBER | ES_AUTOHSCROLL,
-        350, 174, 90, 24,
+        350, 202, 90, 24,
         ID_UNLOCK_ATTEMPTS,
         WS_EX_CLIENTEDGE);
 
     g_chkAutoRestore = MakeControl(
         L"BUTTON",
-        L"Automatically restore MemClock when off target",
+        L"Automatically restore selected P-State if it changes",
         BS_AUTOCHECKBOX,
-        18, 208, 400, 24,
+        18, 236, 420, 24,
         ID_AUTO_RESTORE);
 
     g_chkTrayTelemetry = MakeControl(
         L"BUTTON",
         L"Show telemetry when hovering over tray icon",
         BS_AUTOCHECKBOX,
-        18, 244, 300, 24,
+        18, 272, 320, 24,
         ID_TRAY_TELEMETRY);
 
     g_chkStartup = MakeControl(
         L"BUTTON",
         L"Start with Windows",
         BS_AUTOCHECKBOX,
-        18, 278, 160, 24,
+        18, 306, 160, 24,
         ID_STARTUP);
 
     g_chkStartMinimized = MakeControl(
         L"BUTTON",
         L"Start minimized to tray",
         BS_AUTOCHECKBOX,
-        200, 278, 190, 24,
+        200, 306, 190, 24,
         ID_START_MINIMIZED);
 
     MakeControl(
-        L"BUTTON", L"Set MemClock",
+        L"BUTTON", L"Set P-State",
         BS_PUSHBUTTON,
-        18, 320, 165, 32,
-        ID_SET_MEMCLOCK);
+        18, 348, 165, 32,
+        ID_SET_PSTATE);
 
     MakeControl(
-        L"BUTTON", L"Reset MemClock",
+        L"BUTTON", L"Reset P-State",
         BS_PUSHBUTTON,
-        193, 320, 165, 32,
-        ID_RESET_MEMCLOCK);
+        193, 348, 165, 32,
+        ID_RESET_PSTATE);
 
     MakeControl(
         L"BUTTON", L"Save Settings",
         BS_PUSHBUTTON,
-        368, 320, 180, 32,
+        368, 348, 180, 32,
         ID_SAVE);
 
-    MakeControl(L"STATIC", L"Event log", SS_LEFT, 18, 368, 90, 20);
+    MakeControl(L"STATIC", L"Event log", SS_LEFT, 18, 396, 90, 20);
 
     g_log = MakeControl(
         L"EDIT", L"",
         WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL,
-        18, 392, 530, 190,
+        18, 420, 530, 190,
         0,
         WS_EX_CLIENTEDGE);
 
@@ -2549,26 +3243,26 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     case WM_COMMAND:
         switch (LOWORD(wParam))
         {
-        case ID_SET_MEMCLOCK:
+        case ID_SET_PSTATE:
             PullSettingsFromUi();
             SaveSettings();
             ResetWatchdogStateForConfigurationChange();
 
-            if (SetMemClockNow(L"UI"))
+            if (SetPStateNow(L"UI"))
             {
                 Sleep(100);
                 UpdateMainTelemetry();
             }
             return 0;
 
-        case ID_RESET_MEMCLOCK:
+        case ID_RESET_PSTATE:
             // The Auto Restore checkbox is a live control. Sync it before the
             // reset so an unchecked box cannot be ignored by a stale in-memory
-            // setting and immediately re-lock the memory clock on the next tick.
+            // setting and immediately reapply the P-State on the next tick.
             SyncAutoRestoreFromUi(true);
             ResetWatchdogStateForConfigurationChange();
 
-            if (ResetMemClockNow(L"UI"))
+            if (ResetPStateNow())
             {
                 Sleep(100);
                 UpdateMainTelemetry();
@@ -2578,18 +3272,13 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         case ID_TARGET:
             if (HIWORD(wParam) == CBN_SELCHANGE)
             {
-                g_settings.targetMHz = SelectedTargetFromUi();
+                g_settings.targetPState = SelectedPStateFromUi();
                 SaveSettings();
-
-                AppendLog(
-                    L"Target memory clock selected: " +
-                    std::to_wstring(g_settings.targetMHz) +
-                    L" MHz.");
 
                 ResetWatchdogStateForConfigurationChange();
 
                 if (g_settings.autoRestore && !CurrentTargetReached())
-                    SetMemClockNow(L"Target selection");
+                    SetPStateNow(L"Target selection", false);
 
                 UpdateMainTelemetry();
             }
@@ -2600,17 +3289,12 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             {
                 SyncAutoRestoreFromUi(true);
 
-                AppendLog(
-                    g_settings.autoRestore
-                        ? L"Auto Restore enabled."
-                        : L"Auto Restore disabled.");
-
                 ResetWatchdogStateForConfigurationChange();
 
                 // When enabling it, let the option behave immediately instead
                 // of waiting for the next watchdog tick.
                 if (g_settings.autoRestore && !CurrentTargetReached())
-                    SetMemClockNow(L"Auto Restore");
+                    SetPStateNow(L"Auto Restore", false);
 
                 UpdateMainTelemetry();
             }
@@ -2636,14 +3320,11 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 if (!g_powerPaused)
                 {
                     ConnectNvml(true);
-                    RefreshMemoryClockChoices(true);
+                    RefreshPStateChoices(true);
                 }
             }
 
-            if (!UpdateStartupTask(g_settings.startWithWindows))
-                AppendLog(L"Could not update the Windows startup task.");
-            else
-                AppendLog(L"Settings saved.");
+            UpdateStartupRegistration(g_settings.startWithWindows);
 
             UpdateMainTelemetry();
             return 0;
@@ -2660,11 +3341,11 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
             if (CurrentTargetReached())
             {
-                ResetMemClockNow(L"Tray");
+                ResetPStateNow();
             }
             else
             {
-                SetMemClockNow(L"Tray");
+                SetPStateNow(L"Tray");
             }
 
             Sleep(100);
@@ -2678,8 +3359,9 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         break;
 
     case WM_TRAY:
-        // We intentionally use legacy notification-icon callback semantics:
-        // lParam is the mouse/window message.
+        // A WM_MOUSEMOVE delivered for this icon is authoritative. The first
+        // callback captures a fixed icon rectangle so the telemetry card behaves
+        // like a normal tray tooltip and never follows the cursor.
         if (lParam == WM_MOUSEMOVE)
         {
             BeginHover();
@@ -2734,6 +3416,17 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             g_hover = nullptr;
         }
 
+        if (g_hoverFont)
+        {
+            DeleteObject(g_hoverFont);
+            g_hoverFont = nullptr;
+        }
+        if (g_hoverHeaderFont)
+        {
+            DeleteObject(g_hoverHeaderFont);
+            g_hoverHeaderFont = nullptr;
+        }
+
         g_nvml.Close();
 
         PostQuitMessage(0);
@@ -2754,14 +3447,14 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR cmdLine, int nCmdSh
     // Normal watchdog process. Recovery is performed in-process by restarting
     // NPCF only; there is no helper/relaunch path and no RTX GPU reset path.
 
-    g_showExistingMsg = RegisterWindowMessageW(L"NvidiaMemoryWatchdog.Fresh.Show");
+    g_showExistingMsg = RegisterWindowMessageW(L"NvidiaPowerStateWatchdog.Fresh.Show");
     g_taskbarCreatedMsg = RegisterWindowMessageW(L"TaskbarCreated");
 
     // Single instance.
     g_singletonMutex = CreateMutexW(
         nullptr,
         TRUE,
-        L"Local\\NvidiaMemoryWatchdog.Fresh.Singleton");
+        L"Local\\NvidiaPowerStateWatchdog.Fresh.Singleton");
 
     if (g_singletonMutex && GetLastError() == ERROR_ALREADY_EXISTS)
     {
@@ -2771,6 +3464,8 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR cmdLine, int nCmdSh
     }
 
     LoadSettings();
+    RemoveLegacyScheduledTasksSilently();
+    UpdateStartupRegistration(g_settings.startWithWindows);
 
     INITCOMMONCONTROLSEX icc = {};
     icc.dwSize = sizeof(icc);
@@ -2792,7 +3487,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR cmdLine, int nCmdSh
             LR_DEFAULTCOLOR));
     mainClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     mainClass.hbrBackground = GetSysColorBrush(COLOR_WINDOW);
-    mainClass.lpszClassName = L"NMW_Fresh_Main";
+    mainClass.lpszClassName = L"NPSW_Main";
 
     if (!RegisterClassExW(&mainClass))
         return 1;
@@ -2803,20 +3498,20 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR cmdLine, int nCmdSh
     hoverClass.hInstance = hInstance;
     hoverClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     hoverClass.hbrBackground = nullptr;
-    hoverClass.lpszClassName = L"NMW_Fresh_Hover";
+    hoverClass.lpszClassName = L"NPSW_Hover";
 
     if (!RegisterClassExW(&hoverClass))
         return 1;
 
     g_main = CreateWindowExW(
         0,
-        L"NMW_Fresh_Main",
-        L"NVIDIA VRAM Watchdog",
+        L"NPSW_Main",
+        L"NVIDIA PowerState Watchdog",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
         590,
-        640,
+        670,
         nullptr,
         nullptr,
         hInstance,
@@ -2845,7 +3540,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR cmdLine, int nCmdSh
         AppendLog(L"Warning: could not register session display-status notifications; Modern Standby protection may be incomplete.");
 
     ConnectNvml(true);
-    RefreshMemoryClockChoices(true);
+    RefreshPStateChoices(true);
 
     {
         std::wstring npcfInstanceId;
@@ -2860,18 +3555,16 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR cmdLine, int nCmdSh
         else
         {
             AppendLog(
-                L"NPCF not found; NVML lock retries remain available.");
+                L"NPCF not found; recovery unavailable.");
         }
     }
-
-    AppendLog(L"State Unlock Mode: NPCF restart");
 
     if (g_settings.autoRestore)
     {
         // Request the selected target immediately. The regular watchdog verifies
         // actual telemetry and, if the request is accepted but not enforced,
         // escalates only to an NPCF restart. The RTX GPU is never reset.
-        SetMemClockNow(L"Startup");
+        SetPStateNow(L"Startup");
     }
 
     EnsureTrayIcon();

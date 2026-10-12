@@ -1,2 +1,2 @@
 #include "resource.h"
-IDI_APP_ICON ICON "NvidiaMemoryWatchdog.ico"
+IDI_APP_ICON ICON "NvidiaPowerStateWatchdog.ico"
