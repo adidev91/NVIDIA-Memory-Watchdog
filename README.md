@@ -1,8 +1,8 @@
 # NVIDIA PowerState Watchdog
 
-**NVIDIA PowerState Watchdog** is a native Windows utility that monitors an NVIDIA GPU's actual performance state (P-State) and automatically restores a selected state when the driver or platform moves away from it.
+**NVIDIA PowerState Watchdog** is a native Windows utility that monitors an NVIDIA GPU's actual performance state (P-State) and automatically restores a selected state when the GPU moves away from it.
 
-The selected **P-State is the target**. NVIDIA NVML memory-clock locking is used underneath as the control mechanism because NVML does not expose a public direct `SetPState(Px)` command.
+The selected **P-State is the target**. The watchdog changes the GPU's P-State indirectly by setting the memory clock associated with that state.
 
 > **Unofficial project:** NVIDIA PowerState Watchdog is not affiliated with, endorsed by, or supported by NVIDIA Corporation. NVIDIA, GeForce, and related marks are trademarks of their respective owners.
 
@@ -10,8 +10,9 @@ The selected **P-State is the target**. NVIDIA NVML memory-clock locking is used
 
 - Monitors the GPU's actual NVIDIA P-State.
 - Dynamically detects the P-States exposed by the selected GPU.
-- Maps each usable P-State to its corresponding NVML memory-clock policy.
+- Determines the memory clock associated with each usable P-State.
 - Lets the user select a target P-State such as `P0`, `P2`, or `P4`.
+- Changes the memory clock to the value associated with the selected P-State.
 - Automatically restores the selected P-State if the GPU moves away from it.
 - Uses normal NVML recovery first.
 - If the requested state cannot be restored normally, restarts only **NVIDIA Platform Controllers and Framework (NPCF)**.
@@ -22,13 +23,31 @@ The selected **P-State is the target**. NVIDIA NVML memory-clock locking is used
 - Runs in the notification area with optional live telemetry on hover.
 - Records recovery activity with full local date and time.
 
+## How P-State control works
+
+NVIDIA PowerState Watchdog does not directly set the GPU/core frequency.
+
+Instead, it changes the **memory clock** to the value associated with the selected P-State.
+
+For example, if the GPU exposes:
+
+```text
+P0 -> 14001 MHz
+P2 -> 11001 MHz
+P4 ->  9001 MHz
+```
+
+selecting `P0` causes the watchdog to request the `14001 MHz` memory clock, causing the GPU to enter the corresponding P-State.
+
+The watchdog does **not** lock or directly control the GPU/core clock. Graphics frequency remains dynamically controlled by the NVIDIA driver and continues to scale normally with workload, power, voltage, and thermal conditions.
+
 ## P-State discovery
 
 NVIDIA PowerState Watchdog does not assume a fixed set of P-States or memory clocks.
 
-At runtime the application asks NVML which P-States are exposed by the selected GPU and determines the memory-clock policy associated with each usable state.
+At runtime, the application detects the P-States exposed by the selected GPU and determines the memory clock associated with each usable state.
 
-For example, one RTX 5090 Laptop GPU reports:
+For example, one RTX 5090 Laptop GPU may report:
 
 ```text
 P0 -> 14001 MHz
@@ -38,15 +57,15 @@ P5 ->   810 MHz
 P8 ->   405 MHz
 ```
 
-Another GPU may expose a completely different set of states and clocks.
+Another GPU may expose a different set of states and clocks.
 
 Clearly separated deep low-power states used for idle/display operation are filtered from the normal target list rather than being presented as performance targets.
 
 The filtering is based on the detected clock table rather than hardcoded GPU models or fixed P-State numbers.
 
-## Overclock support
+## Memory overclock support
 
-The watchdog monitors **P-State**, not whether the live memory clock exactly matches the stock clock.
+The watchdog monitors **P-State**, not whether the live memory clock exactly matches the stock memory clock associated with that state.
 
 For example:
 
@@ -59,23 +78,35 @@ Memory OC:       +1800 MHz
 
 is considered healthy and does not trigger recovery.
 
-If the GPU instead moves to another P-State while the target remains P0, recovery can be triggered even if the memory-clock difference itself is relatively small.
+The GPU is still in the requested P-State even though the live memory clock is higher because of the user's overclock.
 
-The application does not modify the user's memory overclock offset. Afterburner, NVIDIA software, or another tuning utility remains responsible for the overclock itself.
+If the GPU instead moves to another P-State while the target remains P0, recovery can be triggered.
+
+The application does not modify the user's memory overclock offset. Afterburner, NVIDIA software, or another tuning utility remains responsible for applying the overclock itself.
 
 ## Recovery
 
 Recovery is intentionally conservative.
 
 1. Detect that the actual P-State no longer matches the selected target.
-2. Reapply the NVML memory policy mapped to the selected target P-State.
+2. Reapply the memory clock associated with the selected target P-State through NVML.
 3. Retry normal NVML recovery first.
-4. If the requested state is accepted but still cannot be restored, restart only **NVIDIA Platform Controllers and Framework (NPCF)**.
+4. If the selected P-State still cannot be restored, restart only **NVIDIA Platform Controllers and Framework (NPCF)**.
 5. Verify that the selected P-State returns.
 
-The target NVML request is applied before NPCF is restarted so the requested policy is already armed when the platform controller comes back online.
+The target memory clock is requested before NPCF is restarted so the desired state is already requested when the platform controller comes back online.
 
 There is **no automatic NVIDIA display-adapter restart or removal path**.
+
+## NPCF State Unlock
+
+On affected NVIDIA laptop platforms, the GPU may remain stuck in a lower P-State even after NVML accepts the requested memory clock.
+
+Restarting **NVIDIA Platform Controllers and Framework** refreshes the NVIDIA platform state without restarting or removing the RTX display adapter.
+
+The watchdog refers to this recovery path as **State Unlock**.
+
+Only NPCF is restarted. The RTX GPU itself is not restarted.
 
 ## Example recovery
 
@@ -106,7 +137,7 @@ The event log intentionally stays relatively sparse rather than logging every po
 
 When the session display turns off or Windows suspends, monitoring pauses and NVML is closed so legitimate low-power GPU states do not trigger recovery.
 
-When the session becomes active again, the application waits briefly for the NVIDIA driver, reconnects to NVML, reapplies the selected P-State policy when automatic restore is enabled, and resumes monitoring.
+When the session becomes active again, the application waits briefly for the NVIDIA driver, reconnects to NVML, reapplies the memory clock associated with the selected P-State when automatic restore is enabled, and resumes monitoring.
 
 This also prevents the watchdog from attempting NPCF recovery during Modern Standby maintenance wakes.
 
@@ -116,7 +147,7 @@ This also prevents the watchdog from attempting NPCF recovery during Modern Stan
 
 Older scheduled-task startup entries from previous NVIDIA Memory Watchdog versions are removed during migration.
 
-The application requests Administrator privileges because NVML memory-clock policy changes and NPCF device restart require elevation on the tested system.
+The application requests Administrator privileges because NVML memory-clock changes and NPCF device restart require elevation on the tested system.
 
 Normal Windows UAC policy therefore still applies when the application launches at startup.
 
@@ -143,7 +174,9 @@ See [`docs/PRODUCTION_AUDIT.txt`](docs/PRODUCTION_AUDIT.txt) for additional prod
 - Administrator privileges
 - Visual Studio with **Desktop development with C++** when building from source
 
-No CUDA SDK or separate NVIDIA SDK is required. The application dynamically loads the NVML DLL installed with the NVIDIA driver.
+No CUDA SDK or separate NVIDIA SDK is required.
+
+The application dynamically loads the NVML DLL installed with the NVIDIA driver.
 
 ## Build
 
@@ -197,7 +230,9 @@ If NVIDIA PowerState Watchdog is useful to you and you would like to support con
 
 ## Disclaimer
 
-This software changes NVIDIA GPU clock policy and may restart the NVIDIA Platform Controllers and Framework device when recovery is required.
+This software changes the NVIDIA GPU's **P-State by changing its memory clock** and may restart the NVIDIA Platform Controllers and Framework device when recovery is required.
+
+It does **not** lock or directly control the GPU/core clock.
 
 Hardware, firmware, BIOS, driver, and OEM implementations vary. Behavior observed on one system is not guaranteed on another.
 
