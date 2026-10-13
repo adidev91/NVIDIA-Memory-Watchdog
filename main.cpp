@@ -692,6 +692,9 @@ struct HoverRow
 static bool g_hoverActive = false;
 static std::vector<HoverRow> g_hoverRows;
 static std::wstring g_hoverMessage;
+static POINT g_hoverSourcePoint = {};
+static RECT g_hoverSourceRect = {};
+static bool g_hoverSourceValid = false;
 static RECT g_hoverIconRect = {};
 static bool g_hoverIconRectValid = false;
 // The hover rectangle is captured once when OUR notification icon first sends
@@ -2208,9 +2211,19 @@ static void CompleteWatchdogResume()
 
 static void ApplyTrayTooltip()
 {
-    g_nid.szTip[0] = L'\0';
-    if (!g_settings.showTrayTelemetry)
-        wcsncpy_s(g_nid.szTip, _countof(g_nid.szTip), L"NVIDIA PowerState Watchdog", _TRUNCATE);
+    // Version-4 notification icons suppress the standard shell tooltip unless
+    // NIF_SHOWTIP is set. Keep the app name available for the native tooltip,
+    // but expose it only when custom telemetry is disabled.
+    wcsncpy_s(
+        g_nid.szTip,
+        _countof(g_nid.szTip),
+        L"NVIDIA PowerState Watchdog",
+        _TRUNCATE);
+
+    if (g_settings.showTrayTelemetry)
+        g_nid.uFlags &= ~NIF_SHOWTIP;
+    else
+        g_nid.uFlags |= NIF_SHOWTIP;
 }
 
 static void UpdateTrayTooltip()
@@ -2219,8 +2232,12 @@ static void UpdateTrayTooltip()
         return;
 
     ApplyTrayTooltip();
+
     NOTIFYICONDATAW update = g_nid;
     update.uFlags = NIF_GUID | NIF_TIP;
+    if (!g_settings.showTrayTelemetry)
+        update.uFlags |= NIF_SHOWTIP;
+
     Shell_NotifyIconW(NIM_MODIFY, &update);
 }
 
@@ -2251,6 +2268,15 @@ static bool TryAddTrayIcon()
     if (!Shell_NotifyIconW(NIM_ADD, &g_nid))
         return false;
 
+    NOTIFYICONDATAW version = g_nid;
+    version.uVersion = NOTIFYICON_VERSION_4;
+    if (!Shell_NotifyIconW(NIM_SETVERSION, &version))
+    {
+        Shell_NotifyIconW(NIM_DELETE, &g_nid);
+        return false;
+    }
+
+    g_nid.uVersion = NOTIFYICON_VERSION_4;
     g_trayAdded = true;
     KillTimer(g_main, TIMER_TRAY_RETRY);
     return true;
@@ -2342,62 +2368,73 @@ static bool TrayRect(RECT& rc)
     return SUCCEEDED(Shell_NotifyIconGetRect(&id, &rc));
 }
 
-static void UpdateHoverIconRectFromTrayCallback()
+static bool CaptureHoverSource()
 {
-    POINT pt = {};
-    if (!GetCursorPos(&pt))
-        return;
+    POINT sourcePoint = {};
+    if (!GetCursorPos(&sourcePoint))
+        return false;
 
-    RECT exact = {};
-    if (TrayRect(exact))
+    // Capture the shell surface under the cursor BEFORE our popup is shown.
+    // On the normal notification area this resolves to the tray surface; when
+    // the icon is inside Windows 11's hidden-icons flyout it resolves to that
+    // flyout. Positioning above this source surface keeps the telemetry window
+    // clear of every tray icon instead of merely avoiding our own icon.
+    HWND sourceWindow = WindowFromPoint(sourcePoint);
+    if (!sourceWindow || sourceWindow == g_hover)
+        return false;
+
+    RECT sourceRect = {};
+    if (!GetWindowRect(sourceWindow, &sourceRect) ||
+        sourceRect.right <= sourceRect.left ||
+        sourceRect.bottom <= sourceRect.top)
     {
-        const LONG rawWidth = exact.right - exact.left;
-        const LONG rawHeight = exact.bottom - exact.top;
-
-        // If Explorer returned a rectangle in the same coordinate space as the
-        // cursor, use it verbatim.  If DPI virtualization makes the rectangle
-        // miss the cursor, preserve its reported size but translate it to the
-        // callback point.  Either way the rectangle is captured once and never
-        // follows subsequent mouse movement.
-        if (rawWidth > 0 && rawHeight > 0 && PtInRect(&exact, pt))
-        {
-            g_hoverIconRect = exact;
-            g_hoverIconRectValid = true;
-            return;
-        }
-
-        const LONG width = std::clamp<LONG>(rawWidth > 0 ? rawWidth : 28, 16, 48);
-        const LONG height = std::clamp<LONG>(rawHeight > 0 ? rawHeight : 28, 16, 48);
-        g_hoverIconRect.left = pt.x - width / 2;
-        g_hoverIconRect.right = g_hoverIconRect.left + width;
-        g_hoverIconRect.top = pt.y - height / 2;
-        g_hoverIconRect.bottom = g_hoverIconRect.top + height;
-        g_hoverIconRectValid = true;
-        return;
+        return false;
     }
 
-    // Explorer can temporarily refuse Shell_NotifyIconGetRect (for example
-    // while rebuilding the tray).  A small fixed rectangle around the callback
-    // point is a safe fallback because WM_MOUSEMOVE came from OUR icon.
-    constexpr LONG width = 28;
-    constexpr LONG height = 28;
-    g_hoverIconRect.left = pt.x - width / 2;
-    g_hoverIconRect.right = g_hoverIconRect.left + width;
-    g_hoverIconRect.top = pt.y - height / 2;
-    g_hoverIconRect.bottom = g_hoverIconRect.top + height;
-    g_hoverIconRectValid = true;
-}
-
-static bool MouseOverTrayIcon()
-{
-    if (!g_hoverIconRectValid)
+    HMONITOR monitor = MonitorFromPoint(sourcePoint, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi = {};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(monitor, &mi))
         return false;
 
-    POINT pt = {};
-    if (!GetCursorPos(&pt))
-        return false;
+    const LONG sourceWidth = sourceRect.right - sourceRect.left;
+    const LONG sourceHeight = sourceRect.bottom - sourceRect.top;
+    const LONG monitorWidth = mi.rcMonitor.right - mi.rcMonitor.left;
+    const LONG monitorHeight = mi.rcMonitor.bottom - mi.rcMonitor.top;
 
-    return PtInRect(&g_hoverIconRect, pt) != FALSE;
+    // A desktop-sized host is not a useful exclusion surface. Do not guess a
+    // replacement position in that case; simply skip this hover rather than
+    // putting the popup somewhere unrelated.
+    if (sourceWidth >= monitorWidth * 4 / 5 &&
+        sourceHeight >= monitorHeight * 4 / 5)
+    {
+        return false;
+    }
+
+    g_hoverSourcePoint = sourcePoint;
+    g_hoverSourceRect = sourceRect;
+    g_hoverSourceValid = true;
+
+    // Shell_NotifyIconGetRect is kept only as a best-effort exit detector. It
+    // never controls popup placement. If DPI virtualization makes the returned
+    // icon rect disagree with the cursor, disable this fallback and rely on
+    // NIN_POPUPCLOSE instead of inventing a fake rectangle.
+    RECT iconRect = {};
+    if (TrayRect(iconRect) &&
+        iconRect.right > iconRect.left &&
+        iconRect.bottom > iconRect.top &&
+        PtInRect(&iconRect, sourcePoint))
+    {
+        g_hoverIconRect = iconRect;
+        g_hoverIconRectValid = true;
+    }
+    else
+    {
+        g_hoverIconRect = {};
+        g_hoverIconRectValid = false;
+    }
+
+    return true;
 }
 
 static LRESULT CALLBACK HoverProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -2592,10 +2629,9 @@ static void EnsureHoverWindow()
 
 static void PositionHoverWindow()
 {
-    if (!g_hover || !g_hoverIconRectValid)
+    if (!g_hover || !g_hoverSourceValid)
         return;
 
-    // Size from the structured rows rather than a raw multiline DrawText block.
     constexpr int headerHeight = 31;
     constexpr int rowHeight = 18;
     constexpr int verticalPadding = 18;
@@ -2623,8 +2659,12 @@ static void PositionHoverWindow()
         if (!g_hoverMessage.empty())
         {
             RECT measured = {0, 0, 260, 0};
-            DrawTextW(dc, g_hoverMessage.c_str(), -1, &measured,
-                      DT_LEFT | DT_TOP | DT_NOPREFIX | DT_WORDBREAK | DT_CALCRECT);
+            DrawTextW(
+                dc,
+                g_hoverMessage.c_str(),
+                -1,
+                &measured,
+                DT_LEFT | DT_TOP | DT_NOPREFIX | DT_WORDBREAK | DT_CALCRECT);
             width = std::max(width, static_cast<int>(measured.right - measured.left) + 28);
             bodyHeight = std::max(rowHeight, static_cast<int>(measured.bottom - measured.top));
         }
@@ -2645,73 +2685,36 @@ static void PositionHoverWindow()
     width = std::min(width, 320);
     const int height = headerHeight + verticalPadding + bodyHeight;
 
-    // Behave like a native notification-area tooltip: anchor to the icon itself,
-    // not the cursor, and place the card immediately outside the taskbar edge.
-    // This leaves the icon completely unobstructed for left/right clicks.
-    const RECT icon = g_hoverIconRect;
-    POINT iconCenter = {
-        (icon.left + icon.right) / 2,
-        (icon.top + icon.bottom) / 2
-    };
-
-    HMONITOR monitor = MonitorFromPoint(iconCenter, MONITOR_DEFAULTTONEAREST);
+    HMONITOR monitor = MonitorFromPoint(g_hoverSourcePoint, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi = {};
     mi.cbSize = sizeof(mi);
     if (!GetMonitorInfoW(monitor, &mi))
         return;
 
-    const int monitorWidth = mi.rcMonitor.right - mi.rcMonitor.left;
-    const int monitorHeight = mi.rcMonitor.bottom - mi.rcMonitor.top;
-    const int relX = iconCenter.x - mi.rcMonitor.left;
-    const int relY = iconCenter.y - mi.rcMonitor.top;
+    // System Informer uses the window under the tray hover point as the source
+    // surface and places its mini-info window above that surface. This handles
+    // both the normal taskbar and Windows 11's hidden-icons flyout without
+    // depending on private shell window-class names.
+    const UINT dpi = GetDpiForWindow(g_hover);
+    const int gap = MulDiv(8, dpi ? static_cast<int>(dpi) : 96, 96);
+    const int margin = MulDiv(8, dpi ? static_cast<int>(dpi) : 96, 96);
 
-    const int distLeft = relX;
-    const int distRight = monitorWidth - relX;
-    const int distTop = relY;
-    const int distBottom = monitorHeight - relY;
+    int x = g_hoverSourcePoint.x - width / 2;
+    int y = g_hoverSourceRect.top - height - gap;
 
-    enum class TaskbarEdge { Bottom, Top, Left, Right };
-    TaskbarEdge edge = TaskbarEdge::Bottom;
-    int best = distBottom;
-    if (distTop < best) { best = distTop; edge = TaskbarEdge::Top; }
-    if (distLeft < best) { best = distLeft; edge = TaskbarEdge::Left; }
-    if (distRight < best) { edge = TaskbarEdge::Right; }
+    // If there genuinely is not enough room above the source surface, place the
+    // popup below it. This mirrors mature tray-popup implementations and avoids
+    // ever covering the source itself.
+    if (y < mi.rcWork.top + margin)
+        y = g_hoverSourceRect.bottom + gap;
 
-    constexpr int gap = 8;
-    constexpr int margin = 8;
+    const int minX = static_cast<int>(mi.rcWork.left) + margin;
+    const int maxX = std::max(minX, static_cast<int>(mi.rcWork.right) - width - margin);
+    const int minY = static_cast<int>(mi.rcWork.top) + margin;
+    const int maxY = std::max(minY, static_cast<int>(mi.rcWork.bottom) - height - margin);
 
-    int x = iconCenter.x - width / 2;
-    int y = icon.top - height - gap;
-
-    switch (edge)
-    {
-    case TaskbarEdge::Bottom:
-        x = iconCenter.x - width / 2;
-        y = icon.top - height - gap;
-        break;
-    case TaskbarEdge::Top:
-        x = iconCenter.x - width / 2;
-        y = icon.bottom + gap;
-        break;
-    case TaskbarEdge::Left:
-        x = icon.right + gap;
-        y = iconCenter.y - height / 2;
-        break;
-    case TaskbarEdge::Right:
-        x = icon.left - width - gap;
-        y = iconCenter.y - height / 2;
-        break;
-    }
-
-    // Clamp only to the monitor edges.  Do not clamp the popup back toward the
-    // taskbar work area; its position relative to the icon above is authoritative.
-    const int minX = static_cast<int>(mi.rcMonitor.left) + margin;
-    const int maxX = std::max(minX, static_cast<int>(mi.rcMonitor.right) - width - margin);
-    const int minY = static_cast<int>(mi.rcMonitor.top) + margin;
-    const int maxY = std::max(minY, static_cast<int>(mi.rcMonitor.bottom) - height - margin);
-
-    x = std::max(minX, std::min(x, maxX));
-    y = std::max(minY, std::min(y, maxY));
+    x = std::clamp(x, minX, maxX);
+    y = std::clamp(y, minY, maxY);
 
     const bool geometryChanged =
         x != g_hoverLastX || y != g_hoverLastY ||
@@ -2727,21 +2730,16 @@ static void PositionHoverWindow()
         g_hoverLastY = y;
         g_hoverLastWidth = width;
         g_hoverLastHeight = height;
+    }
 
-        SetWindowPos(
-            g_hover,
-            HWND_TOPMOST,
-            x, y, width, height,
-            SWP_NOACTIVATE | (IsWindowVisible(g_hover) ? 0 : SWP_SHOWWINDOW));
-    }
-    else if (!IsWindowVisible(g_hover))
-    {
-        SetWindowPos(
-            g_hover,
-            HWND_TOPMOST,
-            x, y, width, height,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    }
+    SetWindowPos(
+        g_hover,
+        HWND_TOPMOST,
+        x,
+        y,
+        width,
+        height,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW);
 
     InvalidateRect(g_hover, nullptr, FALSE);
 }
@@ -2811,15 +2809,16 @@ static void BeginHover()
     if (!g_settings.showTrayTelemetry || g_hoverActive)
         return;
 
-    UpdateHoverIconRectFromTrayCallback();
-    if (!g_hoverIconRectValid)
+    if (!CaptureHoverSource())
         return;
 
     g_hoverActive = true;
     g_lastHoverTelemetryTick = GetTickCount64();
     RefreshHoverTelemetry();
-    // Keep hover-exit detection responsive, but telemetry itself refreshes at
-    // 4 Hz. The captured icon rectangle stays fixed until the popup closes.
+
+    // The shell's NIN_POPUPCLOSE is the primary close signal. The timer only
+    // refreshes telemetry and provides a conservative exact-icon fallback on
+    // Windows 11 builds that occasionally miss popup-close notifications.
     if (!StartMainTimer(TIMER_HOVER, 100, L"Warning: tray hover timer could not be started."))
         EndHover();
 }
@@ -2827,6 +2826,7 @@ static void BeginHover()
 static void EndHover()
 {
     g_hoverActive = false;
+    g_hoverSourceValid = false;
     g_hoverIconRectValid = false;
     g_lastHoverTelemetryTick = 0;
     KillTimer(g_main, TIMER_HOVER);
@@ -2840,10 +2840,17 @@ static void HoverTick()
     if (!g_hoverActive)
         return;
 
-    if (!MouseOverTrayIcon())
+    // If the real icon rectangle was trustworthy at popup-open time, use it as
+    // a fast fallback so moving directly to a neighboring tray icon closes our
+    // popup even if Explorer delays/misses NIN_POPUPCLOSE.
+    if (g_hoverIconRectValid)
     {
-        EndHover();
-        return;
+        POINT pt = {};
+        if (!GetCursorPos(&pt) || !PtInRect(&g_hoverIconRect, pt))
+        {
+            EndHover();
+            return;
+        }
     }
 
     const ULONGLONG now = GetTickCount64();
@@ -3338,29 +3345,36 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         break;
 
     case WM_TRAY:
-        // A WM_MOUSEMOVE delivered for this icon is authoritative. The first
-        // callback captures a fixed icon rectangle so the telemetry card behaves
-        // like a normal tray tooltip and never follows the cursor.
-        if (lParam == WM_MOUSEMOVE)
+    {
+        const UINT trayEvent = LOWORD(static_cast<DWORD_PTR>(lParam));
+
+        if (trayEvent == NIN_POPUPOPEN)
         {
             BeginHover();
             return 0;
         }
 
-        if (lParam == WM_LBUTTONDBLCLK)
+        if (trayEvent == NIN_POPUPCLOSE)
+        {
+            EndHover();
+            return 0;
+        }
+
+        if (trayEvent == WM_LBUTTONDBLCLK)
         {
             EndHover();
             ShowMainWindow();
             return 0;
         }
 
-        if (lParam == WM_RBUTTONUP || lParam == WM_CONTEXTMENU)
+        if (trayEvent == WM_RBUTTONUP || trayEvent == WM_CONTEXTMENU)
         {
             EndHover();
             ShowTrayMenu();
             return 0;
         }
         break;
+    }
 
     case WM_CLOSE:
         // X never exits the watchdog. It only hides the window.
