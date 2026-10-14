@@ -2211,19 +2211,25 @@ static void CompleteWatchdogResume()
 
 static void ApplyTrayTooltip()
 {
-    // Version-4 notification icons suppress the standard shell tooltip unless
-    // NIF_SHOWTIP is set. Keep the app name available for the native tooltip,
-    // but expose it only when custom telemetry is disabled.
+    // With version-4 notification icons, the rich hover popup does not require
+    // a native tooltip payload. When custom telemetry is enabled, remove both
+    // NIF_TIP and NIF_SHOWTIP so Explorer has no standard tooltip window to
+    // create behind our popup. When telemetry is disabled, restore the normal
+    // app-name tooltip.
+    if (g_settings.showTrayTelemetry)
+    {
+        g_nid.szTip[0] = L'\0';
+        g_nid.uFlags &= ~(NIF_TIP | NIF_SHOWTIP);
+        return;
+    }
+
     wcsncpy_s(
         g_nid.szTip,
         _countof(g_nid.szTip),
         L"NVIDIA PowerState Watchdog",
         _TRUNCATE);
 
-    if (g_settings.showTrayTelemetry)
-        g_nid.uFlags &= ~NIF_SHOWTIP;
-    else
-        g_nid.uFlags |= NIF_SHOWTIP;
+    g_nid.uFlags |= NIF_TIP | NIF_SHOWTIP;
 }
 
 static void UpdateTrayTooltip()
@@ -2233,10 +2239,30 @@ static void UpdateTrayTooltip()
 
     ApplyTrayTooltip();
 
-    NOTIFYICONDATAW update = g_nid;
-    update.uFlags = NIF_GUID | NIF_TIP;
-    if (!g_settings.showTrayTelemetry)
-        update.uFlags |= NIF_SHOWTIP;
+    NOTIFYICONDATAW update = {};
+    update.cbSize = sizeof(update);
+    update.hWnd = g_nid.hWnd;
+    update.uID = g_nid.uID;
+    update.guidItem = g_trayIconGuid;
+
+    if (g_settings.showTrayTelemetry)
+    {
+        // Clear any tooltip text that Explorer may still have cached from when
+        // telemetry was disabled. This NIM_MODIFY is only the transition that
+        // clears the old payload; g_nid itself remains registered without
+        // NIF_TIP/NIF_SHOWTIP while rich telemetry is active.
+        update.uFlags = NIF_GUID | NIF_TIP;
+        update.szTip[0] = L'\0';
+    }
+    else
+    {
+        update.uFlags = NIF_GUID | NIF_TIP | NIF_SHOWTIP;
+        wcsncpy_s(
+            update.szTip,
+            _countof(update.szTip),
+            L"NVIDIA PowerState Watchdog",
+            _TRUNCATE);
+    }
 
     Shell_NotifyIconW(NIM_MODIFY, &update);
 }
